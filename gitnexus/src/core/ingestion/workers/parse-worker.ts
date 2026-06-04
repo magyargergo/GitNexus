@@ -97,6 +97,7 @@ import { extractTemplateArguments, templateArgumentsIdTag } from '../utils/templ
 import type { LanguageProvider } from '../language-provider.js';
 import type { ParsedFile } from 'gitnexus-shared';
 import { extractParsedFile, type ScopeCaptureSourceKind } from '../scope-extractor-bridge.js';
+import { isScopeResolutionLanguage } from '../scope-resolution/pipeline/migrated-languages.js';
 import { extractLaravelRoutes, type ExtractedRoute } from '../route-extractors/laravel.js';
 
 import { logger } from '../../logger.js';
@@ -1142,25 +1143,26 @@ const processFileGroup = (
     const provider = getProvider(language);
 
     // RFC #909 Ring 2: produce a `ParsedFile` for the new scope-based
-    // resolution pipeline. No-op (returns undefined) for every language
-    // today — only fires once a provider implements `emitScopeCaptures`.
-    // Runs BEFORE legacy extraction and its result is independent: a
-    // failure here is caught inside `extractParsedFile` and does NOT
-    // affect the legacy DAG path that follows.
-    const parsedFile = extractParsedFile(
-      provider,
-      parseContent,
-      file.path,
-      (message) => {
-        if (parentPort) {
-          parentPort.postMessage({ type: 'warning', message });
-        } else {
-          logger.warn(message);
-        }
-      },
-      tree,
-      scopeSourceKind,
-    );
+    // resolution pipeline. Skipped for registry-primary languages — the
+    // scope-resolution phase re-extracts from source on the main thread,
+    // which avoids retaining ~2× semantic model in RAM on huge repos (#1983).
+    let parsedFile: import('gitnexus-shared').ParsedFile | undefined;
+    if (!isScopeResolutionLanguage(language)) {
+      parsedFile = extractParsedFile(
+        provider,
+        parseContent,
+        file.path,
+        (message) => {
+          if (parentPort) {
+            parentPort.postMessage({ type: 'warning', message });
+          } else {
+            logger.warn(message);
+          }
+        },
+        tree,
+        scopeSourceKind,
+      );
+    }
     if (parsedFile !== undefined) result.parsedFiles.push(parsedFile);
 
     // Build per-file type environment + constructor bindings in a single AST walk.

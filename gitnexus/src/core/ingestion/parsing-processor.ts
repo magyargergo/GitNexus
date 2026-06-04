@@ -26,6 +26,7 @@ import {
 } from './utils/ast-helpers.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { buildTypeEnv } from './type-env.js';
+import { accumulateExportedTypesFromParsedNode, type ExportedTypeMap } from './call-processor.js';
 import type { FieldInfo, FieldExtractorContext } from './field-types.js';
 import type { MethodInfo } from './method-types.js';
 import {
@@ -120,9 +121,8 @@ export const mergeChunkResults = (
   graph: KnowledgeGraph,
   symbolTable: SymbolTableWriter,
   chunkResults: readonly ParseWorkerResult[],
+  exportedTypeMap?: ExportedTypeMap,
 ): WorkerExtractedData => {
-  const allCalls: ExtractedCall[] = [];
-  const allAssignments: ExtractedAssignment[] = [];
   const allRoutes: ExtractedRoute[] = [];
   const allFetchCalls: ExtractedFetchCall[] = [];
   const allFetchWrapperDefs: FetchWrapperDef[] = [];
@@ -132,7 +132,6 @@ export const mergeChunkResults = (
   const allRouterModuleAliases: ExtractedRouterModuleAlias[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
-  const allConstructorBindings: FileConstructorBindings[] = [];
   const fileScopeBindingsByFile: FileScopeBindings[] = [];
   const allParsedFiles: ParsedFile[] = [];
 
@@ -160,8 +159,11 @@ export const mergeChunkResults = (
         qualifiedName: sym.qualifiedName,
       });
     }
-    for (const item of result.calls) allCalls.push(item);
-    for (const item of result.assignments) allAssignments.push(item);
+    if (exportedTypeMap) {
+      for (const node of result.nodes) {
+        accumulateExportedTypesFromParsedNode(exportedTypeMap, node, symbolTable);
+      }
+    }
     for (const item of result.routes) allRoutes.push(item);
     for (const item of result.fetchCalls) allFetchCalls.push(item);
     for (const item of result.fetchWrapperDefs ?? []) allFetchWrapperDefs.push(item);
@@ -171,15 +173,14 @@ export const mergeChunkResults = (
     for (const item of result.routerModuleAliases ?? []) allRouterModuleAliases.push(item);
     for (const item of result.toolDefs) allToolDefs.push(item);
     if (result.ormQueries) for (const item of result.ormQueries) allORMQueries.push(item);
-    for (const item of result.constructorBindings) allConstructorBindings.push(item);
     if (result.fileScopeBindings)
       for (const item of result.fileScopeBindings) fileScopeBindingsByFile.push(item);
     if (result.parsedFiles) for (const item of result.parsedFiles) allParsedFiles.push(item);
   }
 
   return {
-    calls: allCalls,
-    assignments: allAssignments,
+    calls: [],
+    assignments: [],
     routes: allRoutes,
     fetchCalls: allFetchCalls,
     fetchWrapperDefs: allFetchWrapperDefs,
@@ -189,7 +190,7 @@ export const mergeChunkResults = (
     routerModuleAliases: allRouterModuleAliases,
     toolDefs: allToolDefs,
     ormQueries: allORMQueries,
-    constructorBindings: allConstructorBindings,
+    constructorBindings: [],
     fileScopeBindings: fileScopeBindingsByFile,
     parsedFiles: allParsedFiles,
   };
@@ -210,6 +211,7 @@ const processParsingWithWorkers = async (
    * `gitnexus/src/storage/parse-cache.ts`.
    */
   outRawResults?: ParseWorkerResult[],
+  exportedTypeMap?: ExportedTypeMap,
 ): Promise<WorkerExtractedData> => {
   // Filter to parseable files only
   const parseableFiles: ParseWorkerInput[] = [];
@@ -254,7 +256,7 @@ const processParsingWithWorkers = async (
   }
 
   // Merge results from all workers into graph and symbol table.
-  const merged = mergeChunkResults(graph, symbolTable, chunkResults);
+  const merged = mergeChunkResults(graph, symbolTable, chunkResults, exportedTypeMap);
 
   // Merge and log skipped languages from workers
   const skippedLanguages = new Map<string, number>();
@@ -1017,6 +1019,7 @@ export const processParsing = async (
    * artifact to cache there). See `gitnexus/src/storage/parse-cache.ts`.
    */
   outRawResults?: ParseWorkerResult[],
+  exportedTypeMap?: ExportedTypeMap,
 ): Promise<WorkerExtractedData | null> => {
   let lastProgress = 0;
   const reportProgress: FileProgressCallback | undefined = onFileProgress
@@ -1062,6 +1065,7 @@ export const processParsing = async (
       workerPool,
       reportProgress,
       outRawResults,
+      exportedTypeMap,
     );
     // Session-scoped quarantine (worker-pool resilience Layer 3): surface
     // any files this pool has decided are unsafe for workers so the

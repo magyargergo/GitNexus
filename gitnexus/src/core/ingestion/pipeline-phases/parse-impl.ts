@@ -20,7 +20,12 @@ import {
   type BindingEntry,
 } from '../binding-accumulator.js';
 import { processParsing, mergeChunkResults } from '../parsing-processor.js';
-import { fileContentHash, computeChunkHash } from '../../../storage/parse-cache.js';
+import {
+  fileContentHash,
+  computeChunkHash,
+  loadParseCacheChunk,
+  persistParseCacheChunk,
+} from '../../../storage/parse-cache.js';
 import type { ParseWorkerResult } from '../workers/parse-worker.js';
 import type { WorkerExtractedData } from '../parsing-processor.js';
 import {
@@ -59,7 +64,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { isDev } from '../utils/env.js';
+import { isDev, parseTruthyEnv } from '../utils/env.js';
 import { isVerboseIngestionEnabled } from '../utils/verbose.js';
 import {
   endTimer,
@@ -67,6 +72,7 @@ import {
   logDeferredProfile,
   startTimer,
 } from '../utils/deferred-resolution-profile.js';
+import { logHeapProbe } from '../utils/heap-probe.js';
 import { extractORMQueriesInline } from './orm-extraction.js';
 
 import { logger } from '../../logger.js';
@@ -470,8 +476,18 @@ export async function runChunkedParseAndResolve(
     // body, which re-read process.env on every iteration even though
     // the env can't change mid-run.
     const verboseThroughputLog = isDev || isVerboseIngestionEnabled();
+    const heapProbeEveryN =
+      parseTruthyEnv(process.env.GITNEXUS_DEBUG_HEAP) || isDeferredResolutionProfileEnabled()
+        ? 25
+        : 0;
 
     for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+      if (heapProbeEveryN > 0 && chunkIdx > 0 && chunkIdx % heapProbeEveryN === 0) {
+        logHeapProbe(
+          `parse-chunk-${chunkIdx}`,
+          `nodes=${graph.nodeCount} parsedFiles=${allParsedFiles.length}`,
+        );
+      }
       const chunkPaths = chunks[chunkIdx];
       // Start wall-clock for the per-chunk throughput log emitted at end
       // of this iteration. The gate is computed once above; here we just
@@ -506,7 +522,8 @@ export async function runChunkedParseAndResolve(
       }
 
       let chunkWorkerData: WorkerExtractedData | null;
-      const cachedRaw = chunkHash && parseCache ? parseCache.entries.get(chunkHash) : undefined;
+      const cachedRaw =
+        chunkHash && parseCache ? await loadParseCacheChunk(parseCache, chunkHash) : undefined;
 
       // Track every chunk hash we touched so the orchestrator can
       // prune stale entries (chunks whose composition no longer
@@ -517,7 +534,7 @@ export async function runChunkedParseAndResolve(
         // Cache hit: replay the cached worker output through the same
         // merge logic the live worker path uses.
         chunkCacheHits++;
-        chunkWorkerData = mergeChunkResults(graph, symbolTable, cachedRaw);
+        chunkWorkerData = mergeChunkResults(graph, symbolTable, cachedRaw, exportedTypeMap);
         if (isDev) {
           logger.info(
             `📦 parse-cache HIT: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash?.slice(0, 8) ?? 'unknown'})`,
@@ -573,6 +590,7 @@ export async function runChunkedParseAndResolve(
             // Capture raw results only when we have a cache to write to —
             // otherwise we'd retain extra arrays for nothing.
             parseCache && chunkHash && activeWorkerPool ? rawResults : undefined,
+            exportedTypeMap,
           );
         } catch (err) {
           if (!(err instanceof WorkerPoolInitializationError)) throw err;
@@ -621,7 +639,7 @@ export async function runChunkedParseAndResolve(
               );
             }
           } else {
-            parseCache.entries.set(chunkHash, rawResults);
+            await persistParseCacheChunk(parseCache, chunkHash, rawResults);
             if (isDev) {
               logger.info(
                 `📦 parse-cache MISS+store: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash.slice(0, 8)})`,
@@ -724,6 +742,11 @@ export async function runChunkedParseAndResolve(
       );
     }
 
+    logHeapProbe(
+      'post-parse-chunks',
+      `routes=${allExtractedRoutes.length} nodes=${graph.nodeCount} parsedFiles=${allParsedFiles.length}`,
+    );
+
     // Deferred end-of-loop extraction (moved out of the per-chunk block):
     //   1. route resolution on all chunks' routes
     // Resolution sees the full repo graph instead of just current-and-earlier
@@ -740,8 +763,10 @@ export async function runChunkedParseAndResolve(
     // Populate `exportedTypeMap` from the in-progress graph so the post-parse
     // enrichment pass (enrichExportedTypeMap) sees cross-file export types.
     if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
+      logHeapProbe('pre-buildExportedTypeMapFromGraph');
       const graphExports = buildExportedTypeMapFromGraph(graph, model.symbols);
       for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
+      logHeapProbe('post-buildExportedTypeMapFromGraph');
     }
     if (allExtractedRoutes.length > 0) {
       const tRoutes = startTimer(deferredProfile);

@@ -44,11 +44,11 @@ import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.j
  * On version mismatch, `loadParseCache` returns an empty cache and the
  * next save overwrites the on-disk file with the new version baked in.
  */
-// Bumped to 3 in RING4-1 (#942): ParseWorkerResult lost its `heritage` field
-// when the legacy heritage path was deleted. Invalidating stale on-disk caches
-// prevents cross-version replay (e.g. a rollback reading a heritage-less cache
-// into legacy code that expects `result.heritage`).
-const SCHEMA_BUMP = 3;
+// Bumped to 4 in #1983: on-disk shards omit legacy DAG fields (`calls`,
+// `assignments`, `constructorBindings`, worker `parsedFiles`) that are no
+// longer consumed after RING4-1 (#942). Scope-resolution re-extracts
+// `ParsedFile` on the main thread.
+const SCHEMA_BUMP = 4;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from
@@ -108,6 +108,14 @@ export interface ParseCache {
    * Transient — never serialized to disk.
    */
   usedKeys: Set<string>;
+  /**
+   * When set, chunk payloads are loaded from / flushed to sharded files on
+   * demand instead of retaining every chunk in `entries` for the whole run
+   * (#1983 — Linux kernel OOM from duplicate in-memory cache + graph).
+   */
+  storagePath?: string;
+  /** Index of chunk hashes known to exist under `storagePath/parse-cache/`. */
+  onDiskKeys?: Set<string>;
 }
 
 /** SHA-256 hex of a single string or buffer. */
@@ -172,6 +180,75 @@ const getCacheIndexPath = (storagePath: string): string =>
 const getCacheChunkPath = (storagePath: string, chunkHash: string): string =>
   path.join(getCacheDirPath(storagePath), `${chunkHash}.json`);
 
+/**
+ * Drop fields that are not replayed by `mergeChunkResults` / parse-impl after
+ * RING4-1 (#942). Shrinks on-disk shards and peak RSS during cold runs.
+ */
+export const slimParseWorkerResultsForCache = (
+  chunkResults: readonly ParseWorkerResult[],
+): ParseWorkerResult[] => {
+  const slim: ParseWorkerResult[] = [];
+  for (const result of chunkResults) {
+    slim.push({
+      ...result,
+      calls: [],
+      assignments: [],
+      constructorBindings: [],
+      parsedFiles: [],
+    });
+  }
+  return slim;
+};
+
+const readParseCacheChunkFromDisk = async (
+  storagePath: string,
+  chunkHash: string,
+): Promise<ParseWorkerResult[] | undefined> => {
+  if (!isValidChunkCacheKey(chunkHash)) return undefined;
+  try {
+    const chunkRaw = await fs.readFile(getCacheChunkPath(storagePath, chunkHash), 'utf-8');
+    const chunkData = JSON.parse(chunkRaw, mapReviver) as ParseWorkerResult[];
+    return Array.isArray(chunkData) ? chunkData : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Load one chunk shard. Does not retain it in `cache.entries`. */
+export const loadParseCacheChunk = async (
+  cache: ParseCache,
+  chunkHash: string,
+): Promise<ParseWorkerResult[] | undefined> => {
+  const inMemory = cache.entries.get(chunkHash);
+  if (inMemory !== undefined) return inMemory;
+  if (cache.storagePath && cache.onDiskKeys?.has(chunkHash)) {
+    return readParseCacheChunkFromDisk(cache.storagePath, chunkHash);
+  }
+  return undefined;
+};
+
+/**
+ * Persist one chunk shard and avoid retaining it in RAM for the rest of the
+ * run. Falls back to `cache.entries` when `storagePath` is unset (unit tests).
+ */
+export const persistParseCacheChunk = async (
+  cache: ParseCache,
+  chunkHash: string,
+  chunkResults: readonly ParseWorkerResult[],
+): Promise<void> => {
+  const slim = slimParseWorkerResultsForCache(chunkResults);
+  if (cache.storagePath) {
+    await fs.mkdir(getCacheDirPath(cache.storagePath), { recursive: true });
+    const payload = JSON.stringify(slim, mapReplacer);
+    await fs.writeFile(getCacheChunkPath(cache.storagePath, chunkHash), payload, 'utf-8');
+    cache.onDiskKeys ??= new Set<string>();
+    cache.onDiskKeys.add(chunkHash);
+    cache.entries.delete(chunkHash);
+    return;
+  }
+  cache.entries.set(chunkHash, slim);
+};
+
 const loadLegacyParseCache = async (storagePath: string): Promise<ParseCache> => {
   const cachePath = getLegacyCachePath(storagePath);
   try {
@@ -184,15 +261,15 @@ const loadLegacyParseCache = async (storagePath: string): Promise<ParseCache> =>
       typeof data.entries !== 'object' ||
       data.entries === null
     ) {
-      return emptyCache();
+      return emptyCache(storagePath);
     }
     const entries = new Map<string, ParseWorkerResult[]>();
     for (const [k, v] of Object.entries(data.entries)) {
       if (Array.isArray(v)) entries.set(k, v as ParseWorkerResult[]);
     }
-    return { version: PARSE_CACHE_VERSION, entries, usedKeys: new Set<string>() };
+    return { version: PARSE_CACHE_VERSION, entries, usedKeys: new Set<string>(), storagePath };
   } catch {
-    return emptyCache();
+    return emptyCache(storagePath);
   }
 };
 
@@ -207,22 +284,24 @@ const loadShardedParseCache = async (storagePath: string): Promise<ParseCache | 
       data.version !== PARSE_CACHE_VERSION ||
       !Array.isArray(data.keys)
     ) {
-      return emptyCache();
+      return emptyCache(storagePath);
     }
 
-    const entries = new Map<string, ParseWorkerResult[]>();
+    const onDiskKeys = new Set<string>();
     for (const chunkHash of data.keys) {
-      if (typeof chunkHash !== 'string' || !isValidChunkCacheKey(chunkHash)) continue;
-      try {
-        const chunkRaw = await fs.readFile(getCacheChunkPath(storagePath, chunkHash), 'utf-8');
-        const chunkData = JSON.parse(chunkRaw, mapReviver) as ParseWorkerResult[];
-        if (Array.isArray(chunkData)) entries.set(chunkHash, chunkData);
-      } catch {
-        /* skip corrupt or missing shard */
+      if (typeof chunkHash === 'string' && isValidChunkCacheKey(chunkHash)) {
+        onDiskKeys.add(chunkHash);
       }
     }
 
-    return { version: PARSE_CACHE_VERSION, entries, usedKeys: new Set<string>() };
+    // Lazy: index only — load individual shards on cache hit (#1983).
+    return {
+      version: PARSE_CACHE_VERSION,
+      entries: new Map<string, ParseWorkerResult[]>(),
+      usedKeys: new Set<string>(),
+      storagePath,
+      onDiskKeys,
+    };
   } catch {
     return null;
   }
@@ -255,20 +334,26 @@ export const saveParseCache = async (storagePath: string, cache: ParseCache): Pr
   await fs.rm(tmpDir, { recursive: true, force: true });
   await fs.mkdir(tmpDir, { recursive: true });
 
-  const keys: string[] = [];
-  for (const [chunkHash, chunkResults] of cache.entries) {
-    if (!isValidChunkCacheKey(chunkHash)) continue;
-    let payload: string;
-    try {
-      payload = JSON.stringify(chunkResults, mapReplacer);
-    } catch {
-      // Extremely dense chunks could theoretically exceed string limits; skip
-      // rather than failing the entire save (orchestrator catches save errors).
+  const keys = [...cache.usedKeys].filter(isValidChunkCacheKey).sort();
+  for (const chunkHash of keys) {
+    const chunkPath = path.join(tmpDir, `${chunkHash}.json`);
+    const inMemory = cache.entries.get(chunkHash);
+    if (inMemory !== undefined) {
+      let payload: string;
+      try {
+        payload = JSON.stringify(inMemory, mapReplacer);
+      } catch {
+        continue;
+      }
+      await fs.writeFile(chunkPath, payload, 'utf-8');
       continue;
     }
-    keys.push(chunkHash);
-    const chunkPath = path.join(tmpDir, `${chunkHash}.json`);
-    await fs.writeFile(chunkPath, payload, 'utf-8');
+    const existingPath = getCacheChunkPath(storagePath, chunkHash);
+    try {
+      await fs.copyFile(existingPath, chunkPath);
+    } catch {
+      /* shard missing — skip; next run treats as cache miss */
+    }
   }
 
   const index: ShardedParseCacheIndex = {
@@ -295,11 +380,21 @@ export const pruneCache = (cache: ParseCache, usedHashes: ReadonlySet<string>): 
       removed++;
     }
   }
+  if (cache.onDiskKeys) {
+    for (const k of cache.onDiskKeys) {
+      if (!usedHashes.has(k)) {
+        cache.onDiskKeys.delete(k);
+        removed++;
+      }
+    }
+  }
   return removed;
 };
 
-const emptyCache = (): ParseCache => ({
+const emptyCache = (storagePath?: string): ParseCache => ({
   version: PARSE_CACHE_VERSION,
   entries: new Map<string, ParseWorkerResult[]>(),
   usedKeys: new Set<string>(),
+  storagePath,
+  onDiskKeys: storagePath ? new Set<string>() : undefined,
 });
