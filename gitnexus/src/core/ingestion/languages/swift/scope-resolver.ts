@@ -50,7 +50,7 @@
 
 import type { ParsedFile, SymbolDefinition } from 'gitnexus-shared';
 import { SupportedLanguages } from 'gitnexus-shared';
-import { loadSwiftPackageConfig } from '../../language-config.js';
+import { loadSwiftWorkspaceConfig } from '../../language-config.js';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { populateClassOwnedMembers, isClassLike } from '../../scope-resolution/scope/walkers.js';
 import { resolveDefGraphId } from '../../scope-resolution/graph-bridge/ids.js';
@@ -79,14 +79,14 @@ const swiftScopeResolver: ScopeResolver = {
   languageProvider: swiftProvider,
   importEdgeReason: 'swift-scope: import',
 
-  // Load the SPM target map (Sources/<Target>/ subtree mapping) once per
-  // workspace pass. Threaded through the orchestrator as `resolutionConfig`
+  // Load the SPM target map (Sources/<Target>/ subtree mapping, including
+  // nested Package.swift manifests) once per workspace pass. Threaded through the orchestrator as `resolutionConfig`
   // and consumed by the three same-module grouping hooks
   // (`emitImplicitImportEdges`, `populateNamespaceSiblings`,
   // `mirrorNamespaceTypeBindings`) via `coerceSwiftTargets` so they group by
   // the SPM target subtree, not the immediate directory. Mirrors
   // `goScopeResolver`'s `loadGoModulePath`.
-  loadResolutionConfig: (repoPath: string) => loadSwiftPackageConfig(repoPath),
+  loadResolutionConfig: (repoPath: string) => loadSwiftWorkspaceConfig(repoPath),
 
   resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig, context) => {
     const ws: SwiftResolveContext = {

@@ -1422,12 +1422,15 @@ function matchSwiftSquare(source: string, openIndex: number): number | null {
   return null;
 }
 
-async function inferSwiftDirectoryTargets(repoRoot: string): Promise<Map<string, string>> {
+async function inferSwiftDirectoryTargets(
+  repoRoot: string,
+  packageDir = '',
+): Promise<Map<string, string>> {
   const targets = new Map<string, string>();
   const sourceDirs = ['Sources', 'Package/Sources', 'src'];
   for (const sourceDir of sourceDirs) {
     try {
-      const fullPath = path.join(repoRoot, sourceDir);
+      const fullPath = path.join(repoRoot, packageDir, sourceDir);
       const entries = await fs.readdir(fullPath, { withFileTypes: true });
       for (const entry of entries) {
         if (entry.isDirectory()) {
@@ -1441,9 +1444,17 @@ async function inferSwiftDirectoryTargets(repoRoot: string): Promise<Map<string,
   return targets;
 }
 
-export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPackageConfig | null> {
+/**
+ * Load the SwiftPM config of the package at `packageDir` (repo root when
+ * omitted). Target directories stay package-relative; see
+ * {@link loadSwiftWorkspaceConfig} for the repo-relative merge.
+ */
+export async function loadSwiftPackageConfig(
+  repoRoot: string,
+  packageDir = '',
+): Promise<SwiftPackageConfig | null> {
   try {
-    const source = await fs.readFile(path.join(repoRoot, 'Package.swift'), 'utf-8');
+    const source = await fs.readFile(path.join(repoRoot, packageDir, 'Package.swift'), 'utf-8');
     const parsed = parseSwiftPackageManifest(source);
     if (parsed.complete) {
       if (isDev) {
@@ -1456,7 +1467,7 @@ export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPac
           declaredTargets: parsed.targets,
         };
       }
-      const inferred = await inferSwiftDirectoryTargets(repoRoot);
+      const inferred = await inferSwiftDirectoryTargets(repoRoot, packageDir);
       return {
         targets: inferred,
         origin: 'package.swift',
@@ -1467,7 +1478,7 @@ export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPac
     // Missing or unreadable — fall through to inferred folders.
   }
 
-  const inferred = await inferSwiftDirectoryTargets(repoRoot);
+  const inferred = await inferSwiftDirectoryTargets(repoRoot, packageDir);
   if (inferred.size > 0) {
     if (isDev) {
       logger.info(`📦 Inferred ${inferred.size} Swift source folders`);
@@ -1475,6 +1486,111 @@ export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPac
     return { targets: inferred, origin: 'directories' };
   }
   return null;
+}
+
+/** Bounds for the Swift package walk, same as the Zig one. */
+const SWIFT_SCAN_MAX_DIRS = 20_000;
+const SWIFT_SCAN_MAX_DEPTH = 24;
+
+/** Xcode bundle directories: never hold a manifest, often numerous. */
+const SWIFT_SKIPPED_DIR_SUFFIXES = ['.xcassets', '.xcodeproj', '.xcworkspace', '.lproj', '.bundle'];
+
+/**
+ * The root config plus every nested SwiftPM package's targets (#3355).
+ *
+ * `loadSwiftPackageConfig` reads only the root package. A monorepo laid out as
+ * `Core/<pkg>/Package.swift` has no root manifest and no root `Sources/`, so it
+ * answers null and every Swift file lands in one `__default__` module — every
+ * file then "sees" every other, and the implicit-import pass emits n² edges.
+ *
+ * Nested targets are keyed by their repo-relative directory, so two packages
+ * declaring the same target name stay two modules. They feed grouping only:
+ * `origin` and `declaredTargets` stay the root's, so explicit `import X`
+ * resolution is unchanged (nested modules resolve through the segment index).
+ *
+ * Called from `ScopeResolver.loadResolutionConfig`, so only repos with Swift
+ * pay for the walk — the same split as `loadZigWorkspaceIndex`.
+ */
+export async function loadSwiftWorkspaceConfig(
+  repoRoot: string,
+): Promise<SwiftPackageConfig | null> {
+  const root = await loadSwiftPackageConfig(repoRoot);
+  const nested = new Map<string, string>();
+  for (const dir of await findSwiftPackageDirs(repoRoot)) {
+    const config = await loadSwiftPackageConfig(repoRoot, dir);
+    if (config === null) continue;
+    for (const targetDir of config.targets.values()) {
+      const posixDir = targetDir.replace(/\\/g, '/');
+      if (path.posix.isAbsolute(posixDir)) continue;
+      const joined = path.posix.normalize(`${dir}/${posixDir}`).replace(/\/+$/, '');
+      if (joined === '..' || joined.startsWith('../')) continue;
+      nested.set(joined, joined);
+    }
+  }
+  if (nested.size === 0) return root;
+
+  // Deepest first, then the root's targets: grouping is first-match, and a
+  // root `Sources/Core` also matches `Features/A/Sources/Core/…` at a segment
+  // boundary, so the more specific nested target must come first.
+  const targets = new Map(
+    [...nested].sort(([a], [b]) => b.length - a.length || a.localeCompare(b)),
+  );
+  for (const [name, dir] of root?.targets ?? []) {
+    if (!targets.has(name)) targets.set(name, dir);
+  }
+  if (isDev) {
+    logger.info(`📦 Found ${nested.size} Swift targets in nested Package.swift manifests`);
+  }
+  return root === null ? { targets, origin: 'directories' } : { ...root, targets };
+}
+
+/** Repo-relative directories below the root that hold a `Package.swift`. */
+async function findSwiftPackageDirs(repoRoot: string): Promise<string[]> {
+  const found: string[] = [];
+  const queue: { dir: string; depth: number }[] = [{ dir: repoRoot, depth: 0 }];
+  // Head index, not `queue.shift()` — see `findZigPackageDirs`.
+  let queueHead = 0;
+  let truncated = false;
+
+  while (queueHead < queue.length) {
+    if (queueHead >= SWIFT_SCAN_MAX_DIRS) {
+      truncated = true;
+      break;
+    }
+    const { dir, depth } = queue[queueHead++]!;
+    let entries: import('fs').Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    // Sorted so the directories a capped walk reaches do not depend on the
+    // filesystem's listing order.
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const name = entry.name;
+        if (name.startsWith('.')) continue;
+        if (SWIFT_SKIPPED_DIR_SUFFIXES.some((suffix) => name.endsWith(suffix))) continue;
+        const childDir = path.join(dir, name);
+        if (isHardcodedIgnoredDirectoryAtPath(repoRoot, childDir)) continue;
+        if (depth >= SWIFT_SCAN_MAX_DEPTH) {
+          truncated = true;
+          continue;
+        }
+        queue.push({ dir: childDir, depth: depth + 1 });
+      } else if (entry.isFile() && entry.name === 'Package.swift' && dir !== repoRoot) {
+        found.push(path.relative(repoRoot, dir).split(path.sep).join('/'));
+      }
+    }
+  }
+
+  if (truncated) {
+    logger.warn(
+      `[swift] Package.swift scan of ${repoRoot} truncated (dir cap ${SWIFT_SCAN_MAX_DIRS}, depth cap ${SWIFT_SCAN_MAX_DEPTH}); files of packages past the cap group into __default__`,
+    );
+  }
+  return found;
 }
 
 /**

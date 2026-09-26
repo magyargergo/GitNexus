@@ -24,7 +24,10 @@
 import type { ParsedFile, SymbolDefinition } from 'gitnexus-shared';
 import { modulePathReaches } from '../../scope-resolution/utils/name-fallback-visibility.js';
 
-/** Keep aligned with loadSwiftPackageConfig: other layouts are unconfigured. */
+/**
+ * Keep aligned with loadSwiftWorkspaceConfig's default layouts. Matched at any
+ * depth, so nested packages (`Core/Pkg/Sources/<Target>`) are covered too.
+ */
 const SWIFT_TARGET_ROOTS: ReadonlySet<string> = new Set(['Sources', 'src']);
 
 /**

@@ -12,10 +12,16 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   loadSwiftPackageConfig,
+  loadSwiftWorkspaceConfig,
   parseSwiftPackageManifest,
   swiftDeclaredTargetPrefix,
 } from '../../../../src/core/ingestion/language-config.js';
-import { coerceDeclaredSwiftTargets } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
+import {
+  coerceDeclaredSwiftTargets,
+  coerceSwiftTargets,
+  groupSwiftFilesBySpmTarget,
+} from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
+import { _captureLogger } from '../../../../src/core/logger.js';
 
 const roots: string[] = [];
 
@@ -448,5 +454,150 @@ let package = Package(
     expect(cfg?.origin).toBe('package.swift');
     expect(cfg!.declaredTargets?.get('T')).toBe('Sources/T');
     expect(cfg!.targets.get('T')).toBe('Sources/T');
+  });
+});
+
+const pkg = (...targets: string[]): string =>
+  `let package = Package(name: "P", targets: [${targets.join(', ')}])`;
+
+describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', () => {
+  it('adds each nested package target keyed by its repo-relative directory', async () => {
+    const root = repo({
+      'Core/Net/Package.swift': pkg('.target(name: "Net")'),
+      'Core/Net/Sources/Net/Client.swift': '',
+      'Features/Login/Package.swift': pkg(
+        '.target(name: "Login")',
+        '.testTarget(name: "LoginTests")',
+      ),
+      'Features/Login/Sources/Login/View.swift': '',
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect(cfg?.origin).toBe('directories');
+    expect([...cfg!.targets.keys()].sort()).toEqual([
+      'Core/Net/Sources/Net',
+      'Features/Login/Sources/Login',
+      'Features/Login/Tests/LoginTests',
+    ]);
+    expect(coerceDeclaredSwiftTargets(cfg)).toBeNull();
+  });
+
+  it('keeps two packages declaring the same target name as two modules', async () => {
+    const root = repo({
+      'Core/A/Package.swift': pkg('.target(name: "Core")'),
+      'Core/B/Package.swift': pkg('.target(name: "Core")'),
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+    const groups = groupSwiftFilesBySpmTarget(
+      ['Core/A/Sources/Core/X.swift', 'Core/B/Sources/Core/Y.swift'],
+      (p) => p,
+      coerceSwiftTargets(cfg),
+    );
+
+    expect(groups.get('Core/A/Sources/Core')).toEqual(['Core/A/Sources/Core/X.swift']);
+    expect(groups.get('Core/B/Sources/Core')).toEqual(['Core/B/Sources/Core/Y.swift']);
+  });
+
+  it('groups a nested file under its own package even when a root target shares the tail', async () => {
+    const root = repo({
+      'Package.swift': pkg('.target(name: "Core")'),
+      'Features/A/Package.swift': pkg('.target(name: "Core")'),
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+    const groups = groupSwiftFilesBySpmTarget(
+      ['Sources/Core/Root.swift', 'Features/A/Sources/Core/Nested.swift'],
+      (p) => p,
+      coerceSwiftTargets(cfg),
+    );
+
+    expect(groups.get('Core')).toEqual(['Sources/Core/Root.swift']);
+    expect(groups.get('Features/A/Sources/Core')).toEqual(['Features/A/Sources/Core/Nested.swift']);
+  });
+
+  it('keeps the root declaration as the only import-resolution map', async () => {
+    const root = repo({
+      'Package.swift': MODELS_APP,
+      'Features/Login/Package.swift': pkg('.target(name: "Login")'),
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect(cfg?.origin).toBe('package.swift');
+    expect([...cfg!.declaredTargets!.keys()].sort()).toEqual(['App', 'Models']);
+    expect([...coerceDeclaredSwiftTargets(cfg)!.keys()].sort()).toEqual(['App', 'Models']);
+    expect([...cfg!.targets.keys()].sort()).toEqual([
+      'App',
+      'Features/Login/Sources/Login',
+      'Models',
+    ]);
+  });
+
+  it('joins a custom path with the package directory and drops one escaping the repo', async () => {
+    const root = repo({
+      'Pkgs/Lib/Package.swift': pkg(
+        '.target(name: "Lib", path: "Code")',
+        '.target(name: "Shared", path: "../Shared")',
+        '.target(name: "Outside", path: "../../../Outside")',
+      ),
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect([...cfg!.targets.keys()].sort()).toEqual(['Pkgs/Lib/Code', 'Pkgs/Shared']);
+  });
+
+  it('infers Sources/* folders for a nested manifest with a completeness hazard', async () => {
+    const root = repo({
+      'Core/Hazard/Package.swift': '#if os(Linux)\n.target(name: "L")\n#endif\n',
+      'Core/Hazard/Sources/App/main.swift': '',
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect([...cfg!.targets.keys()]).toEqual(['Core/Hazard/Sources/App']);
+  });
+
+  it('skips manifests under build output, dependencies, and Xcode bundles', async () => {
+    const root = repo({
+      '.build/checkouts/Dep/Package.swift': pkg('.target(name: "Dep")'),
+      'node_modules/x/Package.swift': pkg('.target(name: "X")'),
+      'App.xcodeproj/Package.swift': pkg('.target(name: "Proj")'),
+      'Assets.xcassets/Package.swift': pkg('.target(name: "Assets")'),
+      'Core/Real/Package.swift': pkg('.target(name: "Real")'),
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect([...cfg!.targets.keys()]).toEqual(['Core/Real/Sources/Real']);
+  });
+
+  it('warns and keeps shallower packages when the walk passes the depth cap', async () => {
+    const deep = Array.from({ length: 26 }, (_, i) => `d${i}`).join('/');
+    const root = repo({
+      'Core/Shallow/Package.swift': pkg('.target(name: "Shallow")'),
+      [`${deep}/Package.swift`]: pkg('.target(name: "Deep")'),
+    });
+
+    const cap = _captureLogger();
+    try {
+      const cfg = await loadSwiftWorkspaceConfig(root);
+      expect([...cfg!.targets.keys()]).toEqual(['Core/Shallow/Sources/Shallow']);
+      expect(cap.text()).toContain('Package.swift scan');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('returns the root config unchanged when no nested package exists', async () => {
+    const root = repo({ 'Sources/App/main.swift': '' });
+    expect(await loadSwiftWorkspaceConfig(root)).toEqual(await loadSwiftPackageConfig(root));
+  });
+
+  it('returns null with no manifest and no source folders anywhere', async () => {
+    const root = repo({ 'README.md': '' });
+    expect(await loadSwiftWorkspaceConfig(root)).toBeNull();
   });
 });
