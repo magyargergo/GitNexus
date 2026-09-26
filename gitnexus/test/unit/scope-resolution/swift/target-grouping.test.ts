@@ -1,21 +1,11 @@
 /**
- * Drift-guard unit test for `groupSwiftFilesBySpmTarget` (issue #1948 U3,
- * KTD2).
- *
- * `groupSwiftFilesBySpmTarget` (`languages/swift/target-grouping.ts`)
- * preserves the legacy `groupSwiftFilesByTarget` (`languages/swift.ts`)
- * bucketing contract for ordinary SPM layouts: one target bucket per file,
- * first-target-wins ordering, and the same `__default__` fallback. It now
- * intentionally differs for issue #2931's repeated-prefix edge case by
- * accepting a later segment-boundary occurrence when an earlier textual
- * occurrence is embedded inside a longer path segment. These tests pin the
- * shared ordinary-layout contract plus that documented #2931 fix.
+ * Unit tests for `groupSwiftFilesByModule` over hand-built `{ targets }`
+ * configs (issue #1948 U3, #3355).
  *
  *   1. A multi-subdir single target buckets into ONE group.
- *   2. A file matching two overlapping same-named target prefixes is
- *      assigned to the FIRST target only (legacy `break`s — no fan-out).
- *   3. Target dirs match only at path-segment boundaries.
- *   4. Unmatched files AND the no-targets case route to `__default__` = all.
+ *   2. A file under two nested target dirs joins the DEEPEST only.
+ *   3. Target dirs match only at path-segment boundaries, from the repo root.
+ *   4. Unmatched files AND the no-targets case route to `__default__`.
  *
  * `coerceSwiftTargets` is also covered: it duck-types `{ targets: Map }`
  * (no `instanceof` on the config object) and returns `null` otherwise.
