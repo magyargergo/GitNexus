@@ -167,7 +167,9 @@ async function scanSwiftWorkspace(repoRoot: string): Promise<SwiftWorkspaceScan>
         }
         if (SWIFT_SKIPPED_DIR_SUFFIXES.some((suffix) => name.endsWith(suffix))) continue;
         if (isHardcodedIgnoredDirectoryAtPath(repoRoot, childDir)) continue;
-        if (depth >= SWIFT_SCAN_MAX_DEPTH) {
+        // Bound what is queued, not only what is read: a root with a huge
+        // fan-out would otherwise allocate far past the cap before it trips.
+        if (depth >= SWIFT_SCAN_MAX_DEPTH || queue.length >= SWIFT_SCAN_MAX_DIRS) {
           truncated = true;
           continue;
         }

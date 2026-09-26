@@ -82,6 +82,10 @@ function workspaceModulesConfig(resolutionConfig: unknown): Partial<SwiftPackage
   return config != null && Array.isArray(config.modules) ? config : null;
 }
 
+function isKnownModuleName(config: Partial<SwiftPackageConfig>, moduleName: string): boolean {
+  return (config.modules ?? []).some((spec) => spec.name === moduleName);
+}
+
 /** Importable module name → member `.swift` files, memoized per file set. */
 function getModuleFilesByName(
   allFilePaths: ReadonlySet<string>,
@@ -189,7 +193,10 @@ function resolveSwiftModuleFiles(moduleName: string, ctx: SwiftResolveContext): 
       const out = excludeImporter(files, ctx.fromFile);
       return out.length > 0 ? out : null;
     }
-    if (workspace.moduleNamesComplete === true) return null;
+    // Known but non-importable (a plugin), or every manifest was read: external.
+    if (workspace.moduleNamesComplete === true || isKnownModuleName(workspace, moduleName)) {
+      return null;
+    }
   }
 
   const declared = workspace === null ? coerceDeclaredSwiftTargets(ctx.resolutionConfig) : null;

@@ -23,7 +23,8 @@
  *     belongs to no target.
  *   - Xcode: exact file membership plus synchronized folders, minus the
  *     folder's exceptions for that target. A file compiled into several
- *     targets belongs to all of them.
+ *     targets belongs to all of them, including a SwiftPM target whose
+ *     directory it also lies under.
  *   - A package manifest (`Package.swift`, `Package@swift-X.Y.swift`) is
  *     compiled on its own against `PackageDescription`: a module of one file.
  *   - Anything else: a module of one file when discovery read every manifest
@@ -97,15 +98,16 @@ export function swiftModuleKeysOf(filePath: string, resolutionConfig: unknown): 
   const matcher = matcherFor(resolutionConfig);
   if (matcher === null) return DEFAULT_KEYS;
   const ancestors = ancestorDirs(norm);
+  const keys = new Set<string>();
 
   for (const dir of ancestors) {
     const key = matcher.spmByDir.get(dir);
     if (key === undefined) continue;
-    if (isFilteredIn(norm, matcher.specByKey.get(key)!)) return [key];
-    break; // The deepest target owns the directory; its filters left this file out.
+    if (isFilteredIn(norm, matcher.specByKey.get(key)!)) keys.add(key);
+    break; // The deepest target owns the directory; its filters may leave this file out.
   }
 
-  const keys = new Set<string>(matcher.xcodeByFile.get(norm) ?? []);
+  for (const key of matcher.xcodeByFile.get(norm) ?? []) keys.add(key);
   for (const dir of ancestors) {
     for (const folder of matcher.xcodeByFolder.get(dir) ?? []) {
       if (!folder.excluded.some((path) => isUnder(norm, path))) keys.add(folder.key);

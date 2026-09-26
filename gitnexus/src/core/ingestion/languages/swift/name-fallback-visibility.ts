@@ -94,8 +94,8 @@ function moduleMembershipAllows(
   }
   const candidateNames = new Set<string>();
   for (const key of candidateKeys) {
-    const name = swiftModuleSpecOf(key, resolutionConfig)?.name;
-    if (name !== undefined) candidateNames.add(name);
+    const spec = swiftModuleSpecOf(key, resolutionConfig);
+    if (spec?.importable === true) candidateNames.add(spec.name);
   }
   for (const imp of callerParsed.parsedImports) {
     const moduleName = imp.targetRaw?.split('.')[0];

@@ -230,10 +230,13 @@ function populateSwiftExtensionOwners(
   parsedFiles: readonly ParsedFile[],
   ctx?: { readonly fileContents: ReadonlyMap<string, string>; readonly resolutionConfig?: unknown },
 ): void {
+  // Every membership: a shared file may extend a type compiled only into a
+  // later target. Stamping never overwrites an owner, so the first match wins.
   const filesByTarget = groupSwiftFilesByModule(
     parsedFiles,
     (parsed) => parsed.filePath,
     ctx?.resolutionConfig,
+    { allMemberships: true },
   );
   for (const files of filesByTarget.values()) {
     stampSwiftExtensionOwnersInTarget(files);

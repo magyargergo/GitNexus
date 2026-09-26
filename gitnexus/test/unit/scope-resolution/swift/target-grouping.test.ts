@@ -226,3 +226,25 @@ describe('swiftC99ModuleName', () => {
     expect(swiftC99ModuleName(name)).toBe(expected);
   });
 });
+
+describe('swiftModuleKeysOf — review fixes (#3355)', () => {
+  it('keeps both a SwiftPM target and an Xcode target that compile the same file', () => {
+    const config = {
+      targets: new Map(),
+      modules: [
+        { key: 'Pkg/Sources/Lib', name: 'Lib', dir: 'Pkg/Sources/Lib', importable: true },
+        {
+          key: 'xcode:App.xcodeproj:App',
+          name: 'App',
+          files: ['Pkg/Sources/Lib/Shared.swift'],
+          importable: true,
+        },
+      ],
+      moduleNamesComplete: true,
+    };
+    expect(swiftModuleKeysOf('Pkg/Sources/Lib/Shared.swift', config)).toEqual([
+      'Pkg/Sources/Lib',
+      'xcode:App.xcodeproj:App',
+    ]);
+  });
+});

@@ -186,6 +186,7 @@ describe('resolveSwiftImportTarget — workspace modules (#3355)', () => {
 
   it('never resolves a plugin, which is not importable', () => {
     expect(resolve('Gen', files, from, config(true))).toBeNull();
+    expect(resolve('Gen', files, from, config(false))).toBeNull();
   });
 
   it('treats an unknown name as external when every manifest was read', () => {

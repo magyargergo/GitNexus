@@ -471,6 +471,11 @@ const moduleKeys = (cfg: SwiftPackageConfig | null): string[] =>
   (cfg?.modules ?? []).map((m) => m.key).sort();
 
 describe('loadSwiftPackageConfig — SwiftPM directory rules', () => {
+  it('prefers the first predefined parent when inferring folders with no manifest', async () => {
+    const root = repo({ 'Sources/Foo/a.swift': '', 'srcs/Foo/b.swift': '' });
+    expect((await loadSwiftPackageConfig(root))?.targets.get('Foo')).toBe('Sources/Foo');
+  });
+
   it('picks one predefined parent per package: the first of Sources, Source, src, srcs', async () => {
     const root = repo({
       'Package.swift': pkg(
@@ -727,6 +732,14 @@ describe('parseXcodeProject', () => {
   it('reports an unparseable project as incomplete', () => {
     expect(parseXcodeProject('{ objects = ', '')).toEqual({ targets: [], complete: false });
   });
+
+  it.each(['\\U12xz', '\\Uzzzz', '\\U12'])(
+    'reports a malformed %s escape as incomplete',
+    (escape) => {
+      const project = `{ objects = { R = { isa = PBXProject; mainGroup = G; targets = ( ); }; G = { isa = PBXGroup; name = "${escape}"; }; }; rootObject = R; }`;
+      expect(parseXcodeProject(project, '').complete).toBe(false);
+    },
+  );
 });
 
 /**

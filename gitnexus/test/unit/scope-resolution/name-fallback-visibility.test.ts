@@ -591,6 +591,7 @@ describe('Swift: isGlobalNameFallbackPlausible with workspace modules (#3355)', 
     targets: new Map(),
     modules: [
       { key: 'Pkg/Lib', name: 'Lib', dir: 'Pkg/Lib', importable: true },
+      { key: 'Pkg/Plugins/Gen', name: 'Gen', dir: 'Pkg/Plugins/Gen', importable: false },
       { key: 'Pkg/Tests/LibTests', name: 'LibTests', dir: 'Pkg/Tests/LibTests', importable: true },
       {
         key: 'xcode:App.xcodeproj:App',
@@ -631,6 +632,12 @@ describe('Swift: isGlobalNameFallbackPlausible with workspace modules (#3355)', 
     expect(check(mkCaller('App/Widget.swift'), 'App/Main.swift')).toBe(false);
     expect(check(mkCaller('App/Widget.swift'), 'App/Shared.swift')).toBe(true);
     expect(check(mkCaller('App/Main.swift'), 'App/Shared.swift')).toBe(true);
+  });
+
+  it('does not treat an import of a plugin name as reaching the plugin', () => {
+    expect(
+      check(mkCaller('App/Main.swift', [namedImport('Gen')]), 'Pkg/Plugins/Gen/main.swift'),
+    ).toBe(false);
   });
 
   it('allows when either side is outside every known module', () => {

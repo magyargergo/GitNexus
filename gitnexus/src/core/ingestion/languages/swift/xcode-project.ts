@@ -296,7 +296,9 @@ class PlistParser {
       if (esc === 'n') out += '\n';
       else if (esc === 't') out += '\t';
       else if (esc === 'U' || esc === 'u') {
-        out += String.fromCharCode(parseInt(this.src.slice(this.i, this.i + 4), 16));
+        const hex = this.src.slice(this.i, this.i + 4);
+        if (!/^[0-9A-Fa-f]{4}$/.test(hex)) throw new Error(`invalid Unicode escape at ${this.i}`);
+        out += String.fromCharCode(Number.parseInt(hex, 16));
         this.i += 4;
       } else out += esc;
     }

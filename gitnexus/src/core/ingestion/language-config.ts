@@ -1579,7 +1579,8 @@ async function inferSwiftDirectoryTargets(
       const fullPath = path.join(repoRoot, packageDir, sourceDir);
       const entries = await fs.readdir(fullPath, { withFileTypes: true });
       for (const entry of entries) {
-        if (entry.isDirectory()) {
+        // First parent in SwiftPM's search order wins a repeated name.
+        if (entry.isDirectory() && !targets.has(entry.name)) {
           targets.set(entry.name, sourceDir + '/' + entry.name);
         }
       }

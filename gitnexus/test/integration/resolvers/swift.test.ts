@@ -1083,6 +1083,7 @@ describe.skipIf(!swiftAvailable)('Swift nested packages (no root Package.swift)'
     expect(moduleHubsOf(result, `${coreNet}/Session.swift`)).toEqual(
       moduleHubsOf(result, `${coreNet}/Client.swift`),
     );
+    expect(moduleHubsOf(result, `${login}/LoginFlow.swift`)).toHaveLength(1);
     expect(moduleHubsOf(result, `${login}/LoginFlow.swift`)).toEqual(
       moduleHubsOf(result, `${login}/Config.swift`),
     );
@@ -1093,8 +1094,9 @@ describe.skipIf(!swiftAvailable)('Swift nested packages (no root Package.swift)'
       `${coreNet}/Client.swift`,
       `${otherNet}/Config.swift`,
       `${login}/Config.swift`,
-    ].map((file) => moduleHubsOf(result, file).join());
-    expect(new Set(hubs).size).toBe(3);
+    ].map((file) => moduleHubsOf(result, file));
+    expect(hubs.every((h) => h.length === 1)).toBe(true);
+    expect(new Set(hubs.map((h) => h[0])).size).toBe(3);
   });
 
   it('keeps package manifests and files outside every target out of any module', () => {
@@ -1145,9 +1147,12 @@ describe.skipIf(!swiftAvailable)('Swift Xcode targets (project.pbxproj)', () => 
 
   it('makes each Xcode target its own module', () => {
     const app = moduleHubsOf(result, 'App/AppMain.swift');
+    const widget = moduleHubsOf(result, 'Widget/WidgetMain.swift');
     expect(app).toHaveLength(1);
+    expect(widget).toHaveLength(1);
     expect(app).toEqual(moduleHubsOf(result, 'App/Config.swift'));
-    expect(app).not.toEqual(moduleHubsOf(result, 'Widget/WidgetMain.swift'));
+    expect(widget).toEqual(moduleHubsOf(result, 'Widget/Config.swift'));
+    expect(app).not.toEqual(widget);
   });
 
   it("resolves Config() to the caller's own target", () => {
