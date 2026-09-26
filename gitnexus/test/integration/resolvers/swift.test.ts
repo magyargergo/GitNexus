@@ -1097,6 +1097,16 @@ describe.skipIf(!swiftAvailable)('Swift nested packages (no root Package.swift)'
     expect(new Set(hubs).size).toBe(3);
   });
 
+  it('keeps package manifests and files outside every target out of any module', () => {
+    for (const file of [
+      'Core/Net/Package.swift',
+      'Features/Login/Package.swift',
+      'Docs/Net/Snippet.swift',
+    ]) {
+      expect(moduleHubsOf(result, file)).toEqual([]);
+    }
+  });
+
   it('resolves `import Net` by module name, not by a folder that happens to be named Net', () => {
     const imported = getRelationships(result, 'IMPORTS')
       .filter((c) => c.sourceFilePath === `${login}/Connect.swift` && c.targetLabel === 'File')

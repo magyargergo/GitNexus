@@ -471,7 +471,7 @@ const moduleKeys = (cfg: SwiftPackageConfig | null): string[] =>
   (cfg?.modules ?? []).map((m) => m.key).sort();
 
 describe('loadSwiftPackageConfig — SwiftPM directory rules', () => {
-  it('finds a target in whichever predefined parent exists (Sources, Source, src, srcs)', async () => {
+  it('picks one predefined parent per package: the first of Sources, Source, src, srcs', async () => {
     const root = repo({
       'Package.swift': pkg(
         '.target(name: "A")',
@@ -486,8 +486,33 @@ describe('loadSwiftPackageConfig — SwiftPM directory rules', () => {
     const cfg = await loadSwiftPackageConfig(root);
 
     expect(cfg?.targets.get('A')).toBe('Source/A');
-    expect(cfg?.targets.get('B')).toBe('srcs/B');
+    // SwiftPM does not fall through per target: B belongs under Source/ too.
+    expect(cfg?.targets.get('B')).toBe('Source/B');
     expect(cfg?.targets.get('BTests')).toBe('Tests/BTests');
+  });
+
+  it('looks for test targets under the source parent when there is no Tests/', async () => {
+    const root = repo({
+      'Package.swift': pkg('.testTarget(name: "LibTests")'),
+      'Sources/LibTests/t.swift': '',
+    });
+
+    expect((await loadSwiftPackageConfig(root))?.targets.get('LibTests')).toBe('Sources/LibTests');
+  });
+
+  it('reads sources: and exclude: lists, and treats a computed list as unreadable', () => {
+    const parsed = parseSwiftPackageManifest(
+      pkg(
+        '.target(name: "Lib", exclude: ["Legacy", "README.md"], sources: ["Core", "Main.swift"])',
+      ),
+    );
+    expect(parsed.filters.get('Lib')).toEqual({
+      sources: ['Core', 'Main.swift'],
+      exclude: ['Legacy', 'README.md'],
+    });
+    expect(parseSwiftPackageManifest(pkg('.target(name: "Lib", exclude: excluded)')).complete).toBe(
+      false,
+    );
   });
 
   it('reads the highest Package@swift-X.Y.swift over Package.swift', async () => {
@@ -522,6 +547,7 @@ describe('loadSwiftWorkspaceConfig — nested packages and Xcode projects (#3355
         '.testTarget(name: "LoginTests")',
       ),
       'Features/Login/Sources/Login/View.swift': '',
+      'Features/Login/Tests/LoginTests/ViewTests.swift': '',
     });
 
     const cfg = await loadSwiftWorkspaceConfig(root);
@@ -646,7 +672,7 @@ describe('loadSwiftWorkspaceConfig — nested packages and Xcode projects (#3355
 
     expect(cfg?.modules?.find((m) => m.name === 'App')).toMatchObject({
       key: 'xcode:App/App.xcodeproj:App',
-      files: ['App/App/AppMain.swift', 'App/Shared/Util.swift'],
+      files: ['App/App/AppMain.swift', 'App/Shared/Util.swift', 'App/Widget/Shared.swift'],
     });
     expect(cfg?.moduleNamesComplete).toBe(false);
   });
@@ -683,12 +709,14 @@ describe('parseXcodeProject', () => {
     expect(parsed.targets).toEqual([
       {
         name: 'App',
-        files: ['App/App/AppMain.swift', 'App/Shared/Util.swift'],
+        moduleName: 'App',
+        files: ['App/App/AppMain.swift', 'App/Shared/Util.swift', 'App/Widget/Shared.swift'],
         folders: [],
         excluded: [],
       },
       {
         name: 'Widget',
+        moduleName: 'WidgetKitExt',
         files: ['App/Shared/Util.swift'],
         folders: ['App/Widget'],
         excluded: ['App/Widget/Preview.swift'],
@@ -704,8 +732,10 @@ describe('parseXcodeProject', () => {
 /**
  * Two targets: `App` via a classic sources phase (one `<group>` file, one
  * `SOURCE_ROOT` file, one SDK framework that must be ignored), and `Widget`
- * via an Xcode 16 synchronized folder with a membership exception, plus the
- * shared SOURCE_ROOT file.
+ * via an Xcode 16 synchronized folder, plus the shared SOURCE_ROOT file.
+ * The folder's exceptions remove `Preview.swift` from `Widget` (which lists
+ * the folder) and add `Shared.swift` to `App` (which does not). `Widget`
+ * sets a literal `PRODUCT_MODULE_NAME`.
  */
 const PBXPROJ = `// !$*UTF8*$!
 {
@@ -718,17 +748,44 @@ const PBXPROJ = `// !$*UTF8*$!
     FMAIN = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMain.swift; sourceTree = "<group>"; };
     FUTIL = { isa = PBXFileReference; path = "Shared/Util.swift"; sourceTree = SOURCE_ROOT; };
     FSDK = { isa = PBXFileReference; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
-    SYNC = { isa = PBXFileSystemSynchronizedRootGroup; exceptions = ( EXC, ); path = Widget; sourceTree = "<group>"; };
+    SYNC = { isa = PBXFileSystemSynchronizedRootGroup; exceptions = ( EXC, EXCAPP, ); path = Widget; sourceTree = "<group>"; };
     EXC = { isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = ( Preview.swift, ); target = TWID; };
+    EXCAPP = { isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = ( Shared.swift, ); target = TAPP; };
     TAPP = { isa = PBXNativeTarget; buildPhases = ( PAPP, ); name = App; };
     PAPP = { isa = PBXSourcesBuildPhase; files = ( BMAIN, BUTIL, BSDK, ); };
     BMAIN = { isa = PBXBuildFile; fileRef = FMAIN; };
     BUTIL = { isa = PBXBuildFile; fileRef = FUTIL; };
     BSDK = { isa = PBXBuildFile; fileRef = FSDK; };
-    TWID = { isa = PBXNativeTarget; buildPhases = ( PWID, ); fileSystemSynchronizedGroups = ( SYNC, ); name = Widget; };
+    TWID = { isa = PBXNativeTarget; buildConfigurationList = CLWID; buildPhases = ( PWID, ); fileSystemSynchronizedGroups = ( SYNC, ); name = Widget; };
+    CLWID = { isa = XCConfigurationList; buildConfigurations = ( CDEBUG, ); };
+    CDEBUG = { isa = XCBuildConfiguration; buildSettings = { PRODUCT_MODULE_NAME = WidgetKitExt; PRODUCT_NAME = "$(TARGET_NAME)"; }; name = Debug; };
     PWID = { isa = PBXSourcesBuildPhase; files = ( BUTIL2, ); };
     BUTIL2 = { isa = PBXBuildFile; fileRef = FUTIL; };
   };
   rootObject = ROOT;
 }
 `;
+
+describe('loadSwiftWorkspaceConfig — compiler module names and filters (#3355)', () => {
+  it('names a SwiftPM module the way the compiler does and rebases sources:/exclude:', async () => {
+    const root = repo({
+      'Pkgs/Kit/Package.swift': pkg(
+        '.target(name: "my-kit", sources: ["Core"], exclude: ["Core/Legacy"])',
+      ),
+      'Pkgs/Kit/Sources/my-kit/Core/A.swift': '',
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect(cfg?.modules).toEqual([
+      {
+        key: 'Pkgs/Kit/Sources/my-kit',
+        name: 'my_kit',
+        dir: 'Pkgs/Kit/Sources/my-kit',
+        importable: true,
+        sources: ['Pkgs/Kit/Sources/my-kit/Core'],
+        excluded: ['Pkgs/Kit/Sources/my-kit/Core/Legacy'],
+      },
+    ]);
+  });
+});

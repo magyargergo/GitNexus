@@ -19,10 +19,17 @@
  *     the loader has already rebased it to the repo root, so a directory
  *     further down the path (a vendored copy of the same layout) is not the
  *     target. One module per file: SwiftPM rejects overlapping target sources.
+ *     A target's `sources:` / `exclude:` narrow it; a file they leave out
+ *     belongs to no target.
  *   - Xcode: exact file membership plus synchronized folders, minus the
  *     folder's exceptions for that target. A file compiled into several
  *     targets belongs to all of them.
- *   - Anything else: the single `__default__` module.
+ *   - A package manifest (`Package.swift`, `Package@swift-X.Y.swift`) is
+ *     compiled on its own against `PackageDescription`: a module of one file.
+ *   - Anything else: a module of one file when discovery read every manifest
+ *     and project (`moduleNamesComplete`), since no module compiles it;
+ *     otherwise the single `__default__` module, because an unread manifest
+ *     or project may be what owns it.
  */
 
 import type { SwiftModuleSpec, SwiftPackageConfig } from '../../language-config.js';
@@ -30,15 +37,36 @@ export { coerceDeclaredSwiftTargets } from '../../language-config.js';
 
 export const DEFAULT_SWIFT_MODULE = '__default__';
 
+const SWIFT_MANIFEST_RE = /(^|\/)Package(@swift-[\d.]+)?\.swift$/;
+
+/**
+ * The module name the compiler derives from a target or product name: every
+ * character that cannot appear in an identifier becomes `_`, and a leading
+ * digit gets a `_` prefix. SwiftPM (`c99name`) and Xcode
+ * (`$(PRODUCT_NAME:c99extidentifier)`) both apply it, so `my-lib` is
+ * `import my_lib`.
+ */
+export function swiftC99ModuleName(name: string): string {
+  const mangled = name.replace(/[^\p{L}\p{M}\p{N}_]/gu, '_');
+  return /^\p{N}/u.test(mangled) ? `_${mangled}` : mangled;
+}
+
+/** True when `filePath` is `dir` or lies below it. */
+function isUnder(filePath: string, dir: string): boolean {
+  return dir === '' || filePath === dir || filePath.startsWith(`${dir}/`);
+}
+
 interface SwiftModuleMatcher {
   readonly spmByDir: ReadonlyMap<string, string>;
   readonly xcodeByFile: ReadonlyMap<string, readonly string[]>;
   readonly xcodeByFolder: ReadonlyMap<
     string,
-    readonly { key: string; excluded: ReadonlySet<string> }[]
+    readonly { key: string; excluded: readonly string[] }[]
   >;
   readonly specByKey: ReadonlyMap<string, SwiftModuleSpec>;
   readonly order: ReadonlyMap<string, number>;
+  /** Leftover files are one-file modules (see the file header). */
+  readonly leftoversStandalone: boolean;
 }
 
 const MATCHERS = new WeakMap<object, SwiftModuleMatcher>();
@@ -63,24 +91,38 @@ export function swiftModuleSpecs(resolutionConfig: unknown): readonly SwiftModul
 
 /** Module keys `filePath` belongs to, in declaration order; `[__default__]` when none. */
 export function swiftModuleKeysOf(filePath: string, resolutionConfig: unknown): readonly string[] {
+  const norm = filePath.includes('\\') ? filePath.replace(/\\/g, '/') : filePath;
+  const standalone = [`file:${norm}`];
+  if (SWIFT_MANIFEST_RE.test(norm)) return standalone;
   const matcher = matcherFor(resolutionConfig);
   if (matcher === null) return DEFAULT_KEYS;
-  const norm = filePath.includes('\\') ? filePath.replace(/\\/g, '/') : filePath;
   const ancestors = ancestorDirs(norm);
 
   for (const dir of ancestors) {
     const key = matcher.spmByDir.get(dir);
-    if (key !== undefined) return [key];
+    if (key === undefined) continue;
+    if (isFilteredIn(norm, matcher.specByKey.get(key)!)) return [key];
+    break; // The deepest target owns the directory; its filters left this file out.
   }
 
   const keys = new Set<string>(matcher.xcodeByFile.get(norm) ?? []);
   for (const dir of ancestors) {
     for (const folder of matcher.xcodeByFolder.get(dir) ?? []) {
-      if (!folder.excluded.has(norm)) keys.add(folder.key);
+      if (!folder.excluded.some((path) => isUnder(norm, path))) keys.add(folder.key);
     }
   }
-  if (keys.size === 0) return DEFAULT_KEYS;
-  return [...keys].sort((a, b) => matcher.order.get(a)! - matcher.order.get(b)!);
+  if (keys.size > 0) {
+    return [...keys].sort((a, b) => matcher.order.get(a)! - matcher.order.get(b)!);
+  }
+  return matcher.leftoversStandalone ? standalone : DEFAULT_KEYS;
+}
+
+/** SwiftPM `sources:` / `exclude:` for a file already under the target directory. */
+function isFilteredIn(filePath: string, spec: SwiftModuleSpec): boolean {
+  if (spec.sources !== undefined && !spec.sources.some((path) => isUnder(filePath, path))) {
+    return false;
+  }
+  return !(spec.excluded ?? []).some((path) => isUnder(filePath, path));
 }
 
 /** The module a key names; undefined for `__default__` or an unknown key. */
@@ -140,7 +182,7 @@ function matcherFor(resolutionConfig: unknown): SwiftModuleMatcher | null {
 
   const spmByDir = new Map<string, string>();
   const xcodeByFile = new Map<string, string[]>();
-  const xcodeByFolder = new Map<string, { key: string; excluded: ReadonlySet<string> }[]>();
+  const xcodeByFolder = new Map<string, { key: string; excluded: readonly string[] }[]>();
   const specByKey = new Map<string, SwiftModuleSpec>();
   const order = new Map<string, number>();
   for (const spec of specs) {
@@ -157,7 +199,7 @@ function matcherFor(resolutionConfig: unknown): SwiftModuleMatcher | null {
       if (keys === undefined) xcodeByFile.set(file, [spec.key]);
       else keys.push(spec.key);
     }
-    const excluded = new Set(spec.excluded ?? []);
+    const excluded = spec.excluded ?? [];
     for (const folder of spec.folders ?? []) {
       const entries = xcodeByFolder.get(folder);
       const entry = { key: spec.key, excluded };
@@ -166,7 +208,9 @@ function matcherFor(resolutionConfig: unknown): SwiftModuleMatcher | null {
     }
   }
 
-  const matcher = { spmByDir, xcodeByFile, xcodeByFolder, specByKey, order };
+  const leftoversStandalone =
+    (resolutionConfig as Partial<SwiftPackageConfig>).moduleNamesComplete === true;
+  const matcher = { spmByDir, xcodeByFile, xcodeByFolder, specByKey, order, leftoversStandalone };
   MATCHERS.set(resolutionConfig, matcher);
   return matcher;
 }

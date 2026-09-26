@@ -28,6 +28,7 @@ import {
   type SwiftModuleSpec,
   type SwiftPackageConfig,
 } from '../../language-config.js';
+import { swiftC99ModuleName } from './target-grouping.js';
 import { parseXcodeProject } from './xcode-project.js';
 
 /** Bounds for the workspace walk, same as the Zig one. */
@@ -57,15 +58,24 @@ export async function loadSwiftWorkspaceConfig(
     if (config.origin !== 'package.swift') complete = false;
     const declared = config.declaredTargets ?? config.targets;
     for (const [name, targetDir] of config.targets) {
-      // Same rebase-and-reject-escapes rule as Zig path deps. An empty result
-      // under a nested package is the repo root, whose prefix matches every file.
-      if (isAbsoluteZigDepPath(targetDir)) continue;
-      const dir = normalizeZigDepPath(packageDir === '' ? targetDir : `${packageDir}/${targetDir}`);
+      // An empty result under a nested package is the repo root, whose prefix
+      // matches every file.
+      const dir = rebase(packageDir, targetDir);
       if (dir === null || (dir === '' && packageDir !== '')) continue;
       // Inferred folders are grouping-only unless the package declared nothing
       // (`origin: 'directories'`), where the folder name is the best guess.
       const importable = config.origin === 'directories' || declared.has(name);
-      modules.push({ key: dir === '' ? '.' : dir, name, dir, importable });
+      const filter = config.targetFilters?.get(name);
+      const sources = filter?.sources?.map((rel) => rebase(dir, rel));
+      const excluded = filter?.exclude?.map((rel) => rebase(dir, rel));
+      modules.push({
+        key: dir === '' ? '.' : dir,
+        name: swiftC99ModuleName(name),
+        dir,
+        importable,
+        ...(sources !== undefined ? { sources: sources.filter(isPath) } : {}),
+        ...(excluded !== undefined ? { excluded: excluded.filter(isPath) } : {}),
+      });
     }
   };
 
@@ -88,7 +98,7 @@ export async function loadSwiftWorkspaceConfig(
     for (const target of parsed.targets) {
       modules.push({
         key: `xcode:${project}:${target.name}`,
-        name: target.name,
+        name: target.moduleName,
         files: target.files,
         folders: target.folders,
         excluded: target.excluded,
@@ -107,6 +117,19 @@ export async function loadSwiftWorkspaceConfig(
     modules,
     moduleNamesComplete: complete,
   };
+}
+
+/**
+ * `rel` joined onto the repo-relative `base`, or null when it is absolute or
+ * escapes the repo — the same rule as Zig path deps.
+ */
+function rebase(base: string, rel: string): string | null {
+  if (isAbsoluteZigDepPath(rel)) return null;
+  return normalizeZigDepPath(base === '' ? rel : `${base}/${rel}`);
+}
+
+function isPath(value: string | null): value is string {
+  return value !== null;
 }
 
 async function scanSwiftWorkspace(repoRoot: string): Promise<SwiftWorkspaceScan> {

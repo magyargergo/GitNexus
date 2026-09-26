@@ -211,6 +211,8 @@ export interface SwiftPackageConfig {
    * is an external module (SDK or dependency), not an unread local one.
    */
   moduleNamesComplete?: boolean;
+  /** `sources:` / `exclude:` per target name, relative to the target directory. */
+  targetFilters?: Map<string, SwiftTargetFilter>;
 }
 
 /** One Swift module (compiler unit) found in the workspace. */
@@ -225,8 +227,13 @@ export interface SwiftModuleSpec {
   readonly files?: readonly string[];
   /** Xcode: repo-relative synchronized folders; files below are members. */
   readonly folders?: readonly string[];
-  /** Xcode: files excluded from this target's synchronized folders. */
+  /**
+   * Repo-relative paths this module leaves out: Xcode synchronized-folder
+   * exceptions, SwiftPM `exclude:`.
+   */
   readonly excluded?: readonly string[];
+  /** SwiftPM `sources:`: repo-relative files or directories; members must be under one. */
+  readonly sources?: readonly string[];
   /** False for SwiftPM plugins: modules, but never `import`-able. */
   readonly importable: boolean;
 }
@@ -807,10 +814,11 @@ function skipSwiftWsAndComments(source: string, start: number): number | null {
 }
 
 /** First `name:` / `path:` string outside comments. Escapes and interpolations are unreadable. */
-function readSwiftFactoryField(
+/** Where `field:`'s value starts in a factory block, or null when absent. */
+function findSwiftFactoryFieldValue(
   block: string,
-  field: 'name' | 'path',
-): { value: string | undefined; keyPresent: boolean } {
+  field: string,
+): { valueAt: number | null } | null {
   let inString: '"' | "'" | null = null;
   let escape = false;
   let inLineComment = false;
@@ -870,15 +878,52 @@ function readSwiftFactoryField(
       i = j - 1;
       continue;
     }
-    const valueAt = skipSwiftWsAndComments(block, colonAt + 1);
-    if (valueAt === null) return { value: undefined, keyPresent: true };
-    const quote = block[valueAt];
-    if (quote !== '"' && quote !== "'") return { value: undefined, keyPresent: true };
-    const parsed = readSwiftSimpleQuotedString(block, valueAt);
-    if (parsed === null) return { value: undefined, keyPresent: true };
-    return { value: parsed, keyPresent: true };
+    return { valueAt: skipSwiftWsAndComments(block, colonAt + 1) };
   }
-  return { value: undefined, keyPresent: false };
+  return null;
+}
+
+function readSwiftFactoryField(
+  block: string,
+  field: 'name' | 'path',
+): { value: string | undefined; keyPresent: boolean } {
+  const found = findSwiftFactoryFieldValue(block, field);
+  if (found === null) return { value: undefined, keyPresent: false };
+  const { valueAt } = found;
+  if (valueAt === null) return { value: undefined, keyPresent: true };
+  const quote = block[valueAt];
+  if (quote !== '"' && quote !== "'") return { value: undefined, keyPresent: true };
+  const parsed = readSwiftSimpleQuotedString(block, valueAt);
+  return { value: parsed ?? undefined, keyPresent: true };
+}
+
+/**
+ * `sources:` / `exclude:` as a list of string literals. `undefined` when the
+ * key is absent; `null` when present but not a plain literal list.
+ */
+function readSwiftFactoryStringList(
+  block: string,
+  field: 'sources' | 'exclude',
+): string[] | null | undefined {
+  const found = findSwiftFactoryFieldValue(block, field);
+  if (found === null) return undefined;
+  let i = found.valueAt;
+  if (i === null || block[i] !== '[') return null;
+  const out: string[] = [];
+  for (;;) {
+    const at = skipSwiftWsAndComments(block, i + 1);
+    if (at === null) return null;
+    if (block[at] === ']') return out;
+    if (block[at] !== '"' && block[at] !== "'") return null;
+    const value = readSwiftSimpleQuotedString(block, at);
+    if (value === null) return null;
+    out.push(value);
+    const after = skipSwiftWsAndComments(block, at + value.length + 2);
+    if (after === null) return null;
+    if (block[after] === ']') return out;
+    if (block[after] !== ',') return null;
+    i = after;
+  }
 }
 
 /** Quoted literal with no escapes. Any `\` (including `\u{…}` and `\(`) is unreadable. */
@@ -1051,7 +1096,15 @@ export interface SwiftManifestParse {
   implicitDirs: Map<string, SwiftTargetDirKind>;
   /** Plugin targets: modules for grouping, never `import`-able. */
   plugins: Set<string>;
+  /** `sources:` / `exclude:` per target name, relative to the target directory. */
+  filters: Map<string, SwiftTargetFilter>;
   complete: boolean;
+}
+
+/** A target's `sources:` / `exclude:` lists; absent means "no filter". */
+export interface SwiftTargetFilter {
+  readonly sources?: readonly string[];
+  readonly exclude?: readonly string[];
 }
 
 /** Heuristic Package.swift scan. Never shells out to `swift package dump-package`. */
@@ -1059,8 +1112,9 @@ export function parseSwiftPackageManifest(source: string): SwiftManifestParse {
   const targets = new Map<string, string>();
   const implicitDirs = new Map<string, SwiftTargetDirKind>();
   const plugins = new Set<string>();
+  const filters = new Map<string, SwiftTargetFilter>();
   if (swiftManifestHasCompletenessHazard(source)) {
-    return { targets, implicitDirs, plugins, complete: false };
+    return { targets, implicitDirs, plugins, filters, complete: false };
   }
 
   const packageTargets = inspectSwiftPackageTargets(source);
@@ -1107,6 +1161,18 @@ export function parseSwiftPackageManifest(source: string): SwiftManifestParse {
       sawUnreadableFactory = true;
       continue;
     }
+    const sources = readSwiftFactoryStringList(block, 'sources');
+    const exclude = readSwiftFactoryStringList(block, 'exclude');
+    if (sources === null || exclude === null) {
+      sawUnreadableFactory = true;
+      continue;
+    }
+    if (sources !== undefined || exclude !== undefined) {
+      filters.set(name, {
+        ...(sources !== undefined ? { sources } : {}),
+        ...(exclude !== undefined ? { exclude } : {}),
+      });
+    }
     const dirKind: SwiftTargetDirKind =
       kind === 'testTarget' ? 'test' : kind === 'plugin' ? 'plugin' : 'source';
     if (dirKind === 'plugin') plugins.add(name);
@@ -1127,6 +1193,7 @@ export function parseSwiftPackageManifest(source: string): SwiftManifestParse {
     targets,
     implicitDirs,
     plugins,
+    filters,
     complete: !sawUnreadableFactory && !packageTargets.helperBuilt,
   };
 }
@@ -1543,16 +1610,23 @@ export async function loadSwiftPackageConfig(
       if (isDev) {
         logger.info(`📦 Loaded ${parsed.targets.size} Swift package targets from Package.swift`);
       }
+      const parents = new Map<SwiftTargetDirKind, string | null>();
       for (const [name, kind] of parsed.implicitDirs) {
-        const dir = await findSwiftPredefinedTargetDir(pkgRoot, name, kind);
-        if (dir !== null) parsed.targets.set(name, dir);
+        if (!parents.has(kind)) parents.set(kind, await findSwiftPredefinedParent(pkgRoot, kind));
+        const parent = parents.get(kind);
+        if (parent != null) parsed.targets.set(name, `${parent}/${name}`);
       }
       // Plugins are modules (grouping) but never `import`-able.
       const declaredTargets = new Map(
         [...parsed.targets].filter(([name]) => !parsed.plugins.has(name)),
       );
       if (parsed.targets.size > 0) {
-        return { targets: parsed.targets, origin: 'package.swift', declaredTargets };
+        return {
+          targets: parsed.targets,
+          origin: 'package.swift',
+          declaredTargets,
+          ...(parsed.filters.size > 0 ? { targetFilters: parsed.filters } : {}),
+        };
       }
       const inferred = await inferSwiftDirectoryTargets(repoRoot, packageDir);
       return { targets: inferred, origin: 'package.swift', declaredTargets };
@@ -1607,17 +1681,19 @@ function compareVersions(a: readonly number[], b: readonly number[]): number {
   return 0;
 }
 
-/** First predefined `<parent>/<name>` directory that exists, else null. */
-async function findSwiftPredefinedTargetDir(
+/**
+ * SwiftPM's parent directory for targets of `kind` in `pkgRoot`: the first
+ * predefined parent that exists, chosen once per package (a target missing
+ * from it is a manifest error in SwiftPM, not a fallthrough). Null when none
+ * exists.
+ */
+async function findSwiftPredefinedParent(
   pkgRoot: string,
-  name: string,
   kind: SwiftTargetDirKind,
 ): Promise<string | null> {
   for (const parent of SWIFT_PREDEFINED_TARGET_PARENTS[kind]) {
     try {
-      if ((await fs.stat(path.join(pkgRoot, parent, name))).isDirectory()) {
-        return `${parent}/${name}`;
-      }
+      if ((await fs.stat(path.join(pkgRoot, parent))).isDirectory()) return parent;
     } catch {
       // Not there — try the next predefined parent.
     }

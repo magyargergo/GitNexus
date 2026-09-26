@@ -14,6 +14,8 @@ import { describe, it, expect } from 'vitest';
 import {
   groupSwiftFilesByModule,
   coerceSwiftTargets,
+  swiftC99ModuleName,
+  swiftModuleKeysOf,
 } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
 
 /** A hand-built `{ targets }` config, as the root-only loader produces. */
@@ -170,5 +172,57 @@ describe('coerceSwiftTargets — duck-type the opaque resolutionConfig', () => {
     expect(coerceSwiftTargets({})).toBeNull();
     expect(coerceSwiftTargets({ targets: 'not-a-map' })).toBeNull();
     expect(coerceSwiftTargets({ goModule: { modulePath: 'x' } })).toBeNull();
+  });
+});
+
+describe('swiftModuleKeysOf — compiler module rules (#3355)', () => {
+  const modules = [
+    {
+      key: 'Pkg/Sources/Lib',
+      name: 'Lib',
+      dir: 'Pkg/Sources/Lib',
+      importable: true,
+      sources: ['Pkg/Sources/Lib/Core', 'Pkg/Sources/Lib/Main.swift'],
+      excluded: ['Pkg/Sources/Lib/Core/Legacy'],
+    },
+  ];
+  const complete = { targets: new Map(), modules, moduleNamesComplete: true };
+  const partial = { targets: new Map(), modules, moduleNamesComplete: false };
+
+  it('makes every package manifest a module of its own', () => {
+    for (const manifest of ['Package.swift', 'Pkg/Package.swift', 'Pkg/Package@swift-5.9.swift']) {
+      expect(swiftModuleKeysOf(manifest, complete)).toEqual([`file:${manifest}`]);
+      expect(swiftModuleKeysOf(manifest, null)).toEqual([`file:${manifest}`]);
+    }
+  });
+
+  it('applies sources: and exclude:, leaving filtered-out files in no target', () => {
+    expect(swiftModuleKeysOf('Pkg/Sources/Lib/Core/A.swift', complete)).toEqual([
+      'Pkg/Sources/Lib',
+    ]);
+    expect(swiftModuleKeysOf('Pkg/Sources/Lib/Main.swift', complete)).toEqual(['Pkg/Sources/Lib']);
+    expect(swiftModuleKeysOf('Pkg/Sources/Lib/Other.swift', complete)).toEqual([
+      'file:Pkg/Sources/Lib/Other.swift',
+    ]);
+    expect(swiftModuleKeysOf('Pkg/Sources/Lib/Core/Legacy/Old.swift', complete)).toEqual([
+      'file:Pkg/Sources/Lib/Core/Legacy/Old.swift',
+    ]);
+  });
+
+  it('keeps leftovers apart only when every manifest and project was read', () => {
+    expect(swiftModuleKeysOf('Scripts/tool.swift', complete)).toEqual(['file:Scripts/tool.swift']);
+    expect(swiftModuleKeysOf('Scripts/tool.swift', partial)).toEqual(['__default__']);
+  });
+});
+
+describe('swiftC99ModuleName', () => {
+  it.each([
+    ['Lib', 'Lib'],
+    ['my-lib', 'my_lib'],
+    ['Widget Extension', 'Widget_Extension'],
+    ['3D', '_3D'],
+    ['Café.Kit', 'Café_Kit'],
+  ])('%s -> %s', (name, expected) => {
+    expect(swiftC99ModuleName(name)).toBe(expected);
   });
 });

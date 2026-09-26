@@ -13,23 +13,32 @@
  *     PBXFileReference, with each reference's path resolved through its
  *     parent PBXGroup chain;
  *   - Xcode 16 synchronized folders: a target lists
- *     PBXFileSystemSynchronizedRootGroup folders whose files all belong to it,
- *     minus the paths in PBXFileSystemSynchronizedBuildFileExceptionSet
- *     `membershipExceptions` for that target.
+ *     PBXFileSystemSynchronizedRootGroup folders whose files all belong to it.
+ *     A PBXFileSystemSynchronizedBuildFileExceptionSet on the folder flips the
+ *     default for one target: for a target that lists the folder, its
+ *     `membershipExceptions` are removed; for any other target, they are added
+ *     (how a file in the app's folder is shared with a widget).
  *
  * Only `<group>` and `SOURCE_ROOT` paths are resolved. SDK, build-product, and
  * absolute references point outside the repo and are skipped. Paths that
- * escape the repo are dropped. The module name is the target name; a custom
- * `PRODUCT_MODULE_NAME` build setting is not read.
+ * escape the repo are dropped.
+ *
+ * Module name: the first literal `PRODUCT_MODULE_NAME` in the target's build
+ * configurations, else its literal `PRODUCT_NAME`, else the target name, the
+ * last two mangled as the compiler does (`swiftC99ModuleName`). A value built
+ * from other settings (`$(…)`) is not expanded.
  */
 
 import { normalizeZigDepPath } from '../../language-config.js';
+import { swiftC99ModuleName } from './target-grouping.js';
 
 type PlistValue = string | PlistValue[] | { [key: string]: PlistValue };
 type PlistDict = { [key: string]: PlistValue };
 
 export interface XcodeTargetMembership {
   readonly name: string;
+  /** The module name `import` uses. */
+  readonly moduleName: string;
   /** Repo-relative `.swift` files listed in the target's sources phase. */
   readonly files: string[];
   /** Repo-relative synchronized folders; every file below is a member. */
@@ -98,6 +107,29 @@ export function parseXcodeProject(source: string, projectDir: string): XcodeProj
     }
   }
 
+  // Synchronized folder → the targets that list it (for exception direction).
+  const folderOwners = new Map<string, Set<string>>();
+  for (const targetId of targetNameById.keys()) {
+    for (const groupId of asArray(obj(targetId)!.fileSystemSynchronizedGroups)) {
+      if (typeof groupId !== 'string') continue;
+      const owners = folderOwners.get(groupId) ?? new Set<string>();
+      owners.add(targetId);
+      folderOwners.set(groupId, owners);
+    }
+  }
+  const exceptionPaths = (groupId: string, exception: PlistDict): string[] => {
+    const folder = pathById.get(groupId);
+    if (folder === undefined) return [];
+    const out: string[] = [];
+    for (const rel of asArray(exception.membershipExceptions)) {
+      if (typeof rel !== 'string') continue;
+      const joined = normalizeZigDepPath(folder === '' ? rel : `${folder}/${rel}`);
+      if (joined !== null && joined !== '') out.push(joined);
+    }
+    return out;
+  };
+
+  const byId = new Map<string, XcodeTargetMembership>();
   for (const [targetId, name] of targetNameById) {
     const target = obj(targetId)!;
     const files: string[] = [];
@@ -117,21 +149,55 @@ export function parseXcodeProject(source: string, projectDir: string): XcodeProj
       const folder = typeof groupId === 'string' ? pathById.get(groupId) : undefined;
       if (folder === undefined) continue;
       folders.push(folder);
-      for (const exceptionId of asArray(obj(groupId)?.exceptions)) {
-        const exception = obj(exceptionId);
-        if (exception?.target !== targetId) continue;
-        for (const rel of asArray(exception.membershipExceptions)) {
-          if (typeof rel !== 'string') continue;
-          const joined = normalizeZigDepPath(folder === '' ? rel : `${folder}/${rel}`);
-          if (joined !== null && joined !== '') excluded.push(joined);
-        }
-      }
     }
 
-    targets.push({ name, files, folders, excluded });
+    const membership = {
+      name,
+      moduleName: moduleNameOf(target, name, obj),
+      files,
+      folders,
+      excluded,
+    };
+    byId.set(targetId, membership);
+    targets.push(membership);
+  }
+
+  // Exceptions flip membership: remove for a target that lists the folder,
+  // add for one that does not.
+  for (const [groupId, owners] of folderOwners) {
+    for (const exceptionId of asArray(obj(groupId)?.exceptions)) {
+      const exception = obj(exceptionId);
+      const targetId = exception?.target;
+      if (exception === undefined || typeof targetId !== 'string') continue;
+      const membership = byId.get(targetId);
+      if (membership === undefined) continue;
+      const paths = exceptionPaths(groupId, exception);
+      if (owners.has(targetId)) membership.excluded.push(...paths);
+      else membership.files.push(...paths.filter((p) => p.endsWith('.swift')));
+    }
   }
 
   return { targets, complete: true };
+}
+
+/** See the file header: literal build settings, else the mangled target name. */
+function moduleNameOf(
+  target: PlistDict,
+  targetName: string,
+  obj: (id: PlistValue | undefined) => PlistDict | undefined,
+): string {
+  const configs = asArray(obj(target.buildConfigurationList)?.buildConfigurations);
+  const literal = (key: string): string | undefined => {
+    for (const configId of configs) {
+      const settings = obj(configId)?.buildSettings;
+      const value = isDict(settings) ? settings[key] : undefined;
+      if (typeof value === 'string' && value !== '' && !value.includes('$')) return value;
+    }
+    return undefined;
+  };
+  const moduleName = literal('PRODUCT_MODULE_NAME');
+  if (moduleName !== undefined) return moduleName;
+  return swiftC99ModuleName(literal('PRODUCT_NAME') ?? targetName);
 }
 
 /**
