@@ -1520,10 +1520,11 @@ export async function loadSwiftWorkspaceConfig(
     const config = await loadSwiftPackageConfig(repoRoot, dir);
     if (config === null) continue;
     for (const targetDir of config.targets.values()) {
-      const posixDir = targetDir.replace(/\\/g, '/');
-      if (path.posix.isAbsolute(posixDir)) continue;
-      const joined = path.posix.normalize(`${dir}/${posixDir}`).replace(/\/+$/, '');
-      if (joined === '..' || joined.startsWith('../')) continue;
+      // Same rebase-and-reject-escapes rule as Zig path deps. An empty result
+      // is the repo root, whose prefix would match every file.
+      if (isAbsoluteZigDepPath(targetDir)) continue;
+      const joined = normalizeZigDepPath(`${dir}/${targetDir}`);
+      if (joined === null || joined === '') continue;
       nested.set(joined, joined);
     }
   }

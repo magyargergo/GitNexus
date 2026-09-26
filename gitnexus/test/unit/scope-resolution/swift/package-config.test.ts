@@ -541,6 +541,8 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
         '.target(name: "Lib", path: "Code")',
         '.target(name: "Shared", path: "../Shared")',
         '.target(name: "Outside", path: "../../../Outside")',
+        '.target(name: "Root", path: "../..")',
+        '.target(name: "Drive", path: "C:/Elsewhere")',
       ),
     });
 

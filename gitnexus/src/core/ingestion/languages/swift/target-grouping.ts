@@ -10,7 +10,7 @@
  * constructor call to a wrong same-simple-named type in another target.
  *
  * The SPM target map is threaded in via the `resolutionConfig` channel
- * (`loadSwiftPackageConfig` → `resolutionConfig` → these hooks); see
+ * (`loadSwiftWorkspaceConfig` → `resolutionConfig` → these hooks); see
  * `scope-resolver.ts` and `scope-resolution/pipeline/run.ts`.
  *
  * Path matching is the same segment-boundary rule as import-config
@@ -29,8 +29,9 @@ const DEFAULT_TARGET = '__default__';
  * (`populateSwiftTargetSiblings`, `mirrorSwiftSiblingTypeBindings`), which copy
  * every file's declarations into every other file and grow as n². Measured at
  * 15 defs per file: 1,000 files add about 3.8 GB of heap, 2,000 would add
- * about 15 GB (#3355). Names in a skipped module still resolve through the
- * global name fallback. `GITNEXUS_SWIFT_MAX_MODULE_FILES` raises or lowers it.
+ * about 15 GB (#3355). Calls in a skipped module fall back to the global name
+ * fallback, which emits lower-confidence (0.5) edges labeled as such.
+ * `GITNEXUS_SWIFT_MAX_MODULE_FILES` raises or lowers the ceiling.
  */
 const DEFAULT_MAX_SWIFT_MODULE_FILES = 1_000;
 

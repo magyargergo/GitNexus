@@ -55,6 +55,8 @@ export function populateSwiftTargetSiblings(
 
   const maxFiles = getMaxSwiftModuleFiles();
   for (const [moduleKey, group] of filesByTarget) {
+    // Runs even for an oversized module: it links fragments of the same type
+    // by owner, not every file to every other, so it does not grow as n².
     populateNestedTypeFragments(group, indexes, augmentations, ctx.fileContents);
     if (group.length < 2) continue; // no file siblings to share
     if (isOversizedSwiftModule('target siblings', moduleKey, group.length, maxFiles)) continue;
