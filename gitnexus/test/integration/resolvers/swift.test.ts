@@ -1067,6 +1067,53 @@ describe.skipIf(!swiftAvailable)(
 );
 
 // ---------------------------------------------------------------------------
+// #3355 — Nested SwiftPM packages with no root manifest. Each package's
+// targets are their own module: files see same-target siblings only, and two
+// packages declaring a target named `Net` stay two modules.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift nested packages (no root Package.swift)', () => {
+  let result: PipelineResult;
+  const login = 'Features/Login/Sources/Login';
+  const otherNet = 'Features/Other/Sources/Net';
+  const coreNet = 'Core/Net/Sources/Net';
+  const packageOf = (filePath: string): string => filePath.split('/Sources/')[0]!;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'swift-nested-packages'), () => {});
+  }, 60000);
+
+  it('emits implicit IMPORTS between files of the same target', () => {
+    const imports = getRelationships(result, 'IMPORTS').map(
+      (c) => `${c.sourceFilePath}->${c.targetFilePath}`,
+    );
+    expect(imports).toContain(`${coreNet}/Session.swift->${coreNet}/Client.swift`);
+    expect(imports).toContain(`${login}/LoginFlow.swift->${login}/Config.swift`);
+  });
+
+  it('emits no implicit IMPORTS across packages, including same-named targets', () => {
+    const crossPackage = getRelationships(result, 'IMPORTS').filter(
+      (c) =>
+        // Manifests belong to no target and share `__default__`, as before.
+        c.sourceFilePath.includes('/Sources/') &&
+        c.targetFilePath.includes('/Sources/') &&
+        packageOf(c.sourceFilePath) !== packageOf(c.targetFilePath),
+    );
+    expect(crossPackage).toEqual([]);
+  });
+
+  it("resolves Config() to the caller's own package", () => {
+    const ctorCalls = getRelationships(result, 'CALLS').filter(
+      (c) => c.target === 'Config' && c.targetLabel === 'Class',
+    );
+    expect(ctorCalls.map((c) => `${c.sourceFilePath}->${c.targetFilePath}`).sort()).toEqual([
+      `${login}/LoginFlow.swift->${login}/Config.swift`,
+      `${otherNet}/Use.swift->${otherNet}/Config.swift`,
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // U4 — BUG1: member-write read/write classification (issue #1948). A Swift
 // assignment LHS `obj.field = x` is wrapped in `directly_assignable_expression`
 // (verified, tree-sitter-swift 0.7.1), so the old `parent.type === 'assignment'`
