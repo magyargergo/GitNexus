@@ -18,10 +18,42 @@
  * matching target; import-config fans a file out to every matching target.
  */
 
+import { logger } from '../../../logger.js';
 import { swiftDeclaredTargetPrefix, type SwiftPackageConfig } from '../../language-config.js';
 export { coerceDeclaredSwiftTargets } from '../../language-config.js';
 
 const DEFAULT_TARGET = '__default__';
+
+/**
+ * Modules larger than this skip the pairwise sibling passes
+ * (`populateSwiftTargetSiblings`, `mirrorSwiftSiblingTypeBindings`), which copy
+ * every file's declarations into every other file and grow as n². Measured at
+ * 15 defs per file: 1,000 files add about 3.8 GB of heap, 2,000 would add
+ * about 15 GB (#3355). Names in a skipped module still resolve through the
+ * global name fallback. `GITNEXUS_SWIFT_MAX_MODULE_FILES` raises or lowers it.
+ */
+const DEFAULT_MAX_SWIFT_MODULE_FILES = 1_000;
+
+export function getMaxSwiftModuleFiles(): number {
+  const raw = process.env.GITNEXUS_SWIFT_MAX_MODULE_FILES;
+  if (raw === undefined || raw === '') return DEFAULT_MAX_SWIFT_MODULE_FILES;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_SWIFT_MODULE_FILES;
+}
+
+/** True, with a warning, when `files` is over the sibling-pass ceiling. */
+export function isOversizedSwiftModule(
+  pass: string,
+  moduleKey: string,
+  files: number,
+  max: number,
+): boolean {
+  if (files <= max) return false;
+  logger.warn(
+    `[swift] ${pass}: skipping module ${moduleKey} (${files} files, ceiling ${max}; set GITNEXUS_SWIFT_MAX_MODULE_FILES to change)`,
+  );
+  return true;
+}
 
 /**
  * Group `items` by SPM target subtree:

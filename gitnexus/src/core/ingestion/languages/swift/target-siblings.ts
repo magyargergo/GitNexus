@@ -29,7 +29,12 @@
 import type { BindingRef, ParsedFile, Scope, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { isClassLike } from '../../scope-resolution/scope/walkers.js';
-import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+import {
+  coerceSwiftTargets,
+  getMaxSwiftModuleFiles,
+  groupSwiftFilesBySpmTarget,
+  isOversizedSwiftModule,
+} from './target-grouping.js';
 
 export function populateSwiftTargetSiblings(
   parsedFiles: readonly ParsedFile[],
@@ -48,9 +53,11 @@ export function populateSwiftTargetSiblings(
 
   const augmentations = indexes.bindingAugmentations as Map<ScopeId, Map<string, BindingRef[]>>;
 
-  for (const [, group] of filesByTarget) {
+  const maxFiles = getMaxSwiftModuleFiles();
+  for (const [moduleKey, group] of filesByTarget) {
     populateNestedTypeFragments(group, indexes, augmentations, ctx.fileContents);
     if (group.length < 2) continue; // no file siblings to share
+    if (isOversizedSwiftModule('target siblings', moduleKey, group.length, maxFiles)) continue;
     const siblings = group.map((parsed) => ({
       filePath: parsed.filePath,
       defs: [...parsed.localDefs] as SymbolDefinition[],

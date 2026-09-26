@@ -33,7 +33,12 @@ import type { ParsedFile, TypeRef } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import type { WorkspaceResolutionIndex } from '../../scope-resolution/workspace-index.js';
 import { followChainPostFinalize } from '../../scope-resolution/passes/imported-return-types.js';
-import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+import {
+  coerceSwiftTargets,
+  getMaxSwiftModuleFiles,
+  groupSwiftFilesBySpmTarget,
+  isOversizedSwiftModule,
+} from './target-grouping.js';
 
 export function mirrorSwiftSiblingTypeBindings(
   parsedFiles: readonly ParsedFile[],
@@ -52,8 +57,12 @@ export function mirrorSwiftSiblingTypeBindings(
     targets,
   );
 
-  for (const [, group] of filesByTarget) {
+  const maxFiles = getMaxSwiftModuleFiles();
+  for (const [moduleKey, group] of filesByTarget) {
     if (group.length < 2) continue; // no siblings to mirror from
+    if (isOversizedSwiftModule('sibling type bindings', moduleKey, group.length, maxFiles)) {
+      continue;
+    }
     const files = group.map((parsed) => parsed.filePath);
     for (const importerFile of files) {
       const importerModule = moduleScopeByFile.get(importerFile);

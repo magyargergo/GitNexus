@@ -3,10 +3,15 @@ import {
   type ParsedFile,
   type ScopeId,
   type SymbolDefinition,
+  type TypeRef,
 } from 'gitnexus-shared';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { populateSwiftTargetSiblings } from '../../../../src/core/ingestion/languages/swift/target-siblings.js';
+import { mirrorSwiftSiblingTypeBindings } from '../../../../src/core/ingestion/languages/swift/sibling-type-bindings.js';
+import { getMaxSwiftModuleFiles } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
 import type { ScopeResolutionIndexes } from '../../../../src/core/ingestion/model/scope-resolution-indexes.js';
+import type { WorkspaceResolutionIndex } from '../../../../src/core/ingestion/scope-resolution/workspace-index.js';
+import { _captureLogger } from '../../../../src/core/logger.js';
 
 const moduleId = (filePath: string) => `scope:${filePath}:module` as ScopeId;
 const classId = (filePath: string) => `scope:${filePath}:class` as ScopeId;
@@ -389,3 +394,97 @@ function qualifiedExtensionFixture(
   const indexes = makeIndexes([owner, entry, makeEntry, ...extraDefs], bindingAugmentations);
   return { declaration, extension, entry, indexes, bindingAugmentations };
 }
+
+describe('Swift sibling passes — module file ceiling (#3355)', () => {
+  const stub = (filePath: string, typeBindings = new Map<string, TypeRef>()): ParsedFile => ({
+    filePath,
+    moduleScope: moduleId(filePath),
+    scopes: [
+      {
+        id: moduleId(filePath),
+        parent: null,
+        kind: 'Module',
+        range: { startLine: 1, startCol: 0, endLine: 10, endCol: 0 },
+        filePath,
+        bindings: new Map(),
+        ownedDefs: [],
+        imports: [],
+        typeBindings,
+      },
+    ],
+    parsedImports: [],
+    localDefs: [
+      {
+        nodeId: `def:${filePath}:T`,
+        filePath,
+        type: 'Class',
+        qualifiedName: `T${filePath.length}`,
+      },
+    ],
+    referenceSites: [],
+  });
+  const siblingIndexes = (files: readonly ParsedFile[]): ScopeResolutionIndexes =>
+    ({
+      moduleScopes: { byFilePath: new Map(files.map((f) => [f.filePath, f.moduleScope])) },
+      bindingAugmentations: new Map(),
+    }) as unknown as ScopeResolutionIndexes;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('shares declarations across a module at the ceiling', () => {
+    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '3');
+    const files = ['A.swift', 'BB.swift', 'CCC.swift'].map((p) => stub(p));
+    const indexes = siblingIndexes(files);
+
+    populateSwiftTargetSiblings(files, indexes, { fileContents: new Map() });
+
+    expect(indexes.bindingAugmentations.size).toBe(3);
+  });
+
+  it('skips a module over the ceiling and warns', () => {
+    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '3');
+    const files = ['A.swift', 'BB.swift', 'CCC.swift', 'DDDD.swift'].map((p) => stub(p));
+    const indexes = siblingIndexes(files);
+    const cap = _captureLogger();
+    try {
+      populateSwiftTargetSiblings(files, indexes, { fileContents: new Map() });
+      expect(indexes.bindingAugmentations.size).toBe(0);
+      expect(cap.text()).toContain('target siblings: skipping module __default__ (4 files');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('skips type-binding mirroring for a module over the ceiling', () => {
+    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '1');
+    const source = stub('Source.swift', new Map([['x', { rawName: 'Box' } as TypeRef]]));
+    const importer = stub('Importer.swift');
+    const workspace = {
+      moduleScopeByFile: new Map(
+        [source, importer].map((f) => [f.filePath, f.scopes[0]!] as const),
+      ),
+    } as unknown as WorkspaceResolutionIndex;
+    const cap = _captureLogger();
+    try {
+      mirrorSwiftSiblingTypeBindings(
+        [source, importer],
+        {} as ScopeResolutionIndexes,
+        workspace,
+        null,
+      );
+      expect(importer.scopes[0]!.typeBindings.size).toBe(0);
+      expect(cap.text()).toContain('sibling type bindings: skipping module __default__ (2 files');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('falls back to the default ceiling for an invalid override', () => {
+    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', 'abc');
+    expect(getMaxSwiftModuleFiles()).toBe(1_000);
+    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '-1');
+    expect(getMaxSwiftModuleFiles()).toBe(1_000);
+  });
+});
