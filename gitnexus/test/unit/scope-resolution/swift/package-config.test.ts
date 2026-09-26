@@ -562,12 +562,15 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
     expect([...cfg!.targets.keys()]).toEqual(['Core/Hazard/Sources/App']);
   });
 
-  it('skips manifests under build output, dependencies, and Xcode bundles', async () => {
+  it('skips manifests under build output, dependencies, and every Xcode bundle suffix', async () => {
     const root = repo({
       '.build/checkouts/Dep/Package.swift': pkg('.target(name: "Dep")'),
       'node_modules/x/Package.swift': pkg('.target(name: "X")'),
       'App.xcodeproj/Package.swift': pkg('.target(name: "Proj")'),
       'Assets.xcassets/Package.swift': pkg('.target(name: "Assets")'),
+      'App.xcworkspace/Package.swift': pkg('.target(name: "Ws")'),
+      'en.lproj/Package.swift': pkg('.target(name: "Loc")'),
+      'Res.bundle/Package.swift': pkg('.target(name: "Res")'),
       'Core/Real/Package.swift': pkg('.target(name: "Real")'),
     });
 
