@@ -7,7 +7,11 @@ import { describe, expect, it } from 'vitest';
 import type { ParsedFile, ParsedImport, ScopeId } from 'gitnexus-shared';
 import { createKnowledgeGraph } from '../../../../src/core/graph/graph.js';
 import { generateId } from '../../../../src/lib/utils.js';
-import { emitSwiftImplicitImportEdges } from '../../../../src/core/ingestion/languages/swift/implicit-imports.js';
+import {
+  emitSwiftImplicitImportEdges,
+  MAX_SWIFT_IMPLICIT_IMPORT_EDGES,
+} from '../../../../src/core/ingestion/languages/swift/implicit-imports.js';
+import { _captureLogger } from '../../../../src/core/logger.js';
 import { resolveSwiftImportTarget } from '../../../../src/core/ingestion/languages/swift/import-target.js';
 
 const DECLARED = {
@@ -70,5 +74,57 @@ describe('emitSwiftImplicitImportEdges', () => {
       parsedFiles: parsed,
     });
     expect(fromApp).toEqual(expect.arrayContaining([a, other, b]));
+  });
+});
+
+describe('emitSwiftImplicitImportEdges — total edge budget (#3355)', () => {
+  const files = (dir: string, n: number): ParsedFile[] =>
+    Array.from({ length: n }, (_, i) => stubFile(`${dir}/F${i}.swift`));
+  const importCount = (graph: ReturnType<typeof createKnowledgeGraph>): number =>
+    graph.relationships.filter((rel) => rel.type === 'IMPORTS').length;
+
+  it('stays under a quarter of the V8 Map limit by default', () => {
+    expect(MAX_SWIFT_IMPLICIT_IMPORT_EDGES).toBeLessThanOrEqual(2 ** 24 / 4);
+  });
+
+  it('emits every pair of a module that fits the budget', () => {
+    const graph = createKnowledgeGraph();
+    emitSwiftImplicitImportEdges(graph, files('Sources/A', 4), new Map(), DECLARED, 12);
+    expect(importCount(graph)).toBe(12);
+  });
+
+  it('skips a module over the budget and names it in a warning', () => {
+    const graph = createKnowledgeGraph();
+    const cap = _captureLogger();
+    try {
+      emitSwiftImplicitImportEdges(graph, files('App', 5), new Map(), null, 12);
+      expect(importCount(graph)).toBe(0);
+      expect(cap.text()).toContain('module __default__ (5 files');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('bounds the total across modules, filling smallest modules first', () => {
+    const config = {
+      origin: 'directories' as const,
+      targets: new Map([
+        ['A', 'Sources/A'],
+        ['B', 'Sources/B'],
+        ['C', 'Sources/C'],
+      ]),
+    };
+    const parsed = [...files('Sources/A', 3), ...files('Sources/B', 3), ...files('Sources/C', 2)];
+    const graph = createKnowledgeGraph();
+    const cap = _captureLogger();
+    try {
+      // 6 + 2 fit a budget of 12; the second 3-file module (6 more) does not.
+      emitSwiftImplicitImportEdges(graph, parsed, new Map(), config, 12);
+      expect(importCount(graph)).toBe(8);
+      expect(cap.text()).toContain('module B (3 files');
+      expect(cap.text()).not.toContain('module A (');
+    } finally {
+      cap.restore();
+    }
   });
 });
