@@ -22,13 +22,16 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  groupSwiftFilesBySpmTarget,
+  groupSwiftFilesByModule,
   coerceSwiftTargets,
 } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
 
+/** A hand-built `{ targets }` config, as the root-only loader produces. */
+const cfg = (targets: Map<string, string> | null) => (targets === null ? null : { targets });
+
 const id = (s: string) => s;
 
-describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
+describe('groupSwiftFilesByModule — SwiftPM bucketing contract', () => {
   it('buckets a multi-subdir single target into ONE group', () => {
     const files = [
       'Sources/Alpha/Core/User.swift',
@@ -37,33 +40,43 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
     ];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesByModule(files, id, cfg(targets));
 
     expect([...groups.keys()]).toEqual(['Alpha']);
     expect(groups.get('Alpha')).toEqual(files);
     expect(groups.has('__default__')).toBe(false);
   });
 
-  it('assigns a file matching two overlapping same-named prefixes to the FIRST target only', () => {
-    // Both targets are prefixes of the file's path (Beta dir nested under
-    // Alpha). The first configured match wins → one bucket per file.
+  it('assigns a file under two nested target dirs to the DEEPEST target only', () => {
+    // SwiftPM rejects overlapping target sources within one package, so this
+    // only arises across packages; the more specific directory is the module.
     const files = ['Sources/Alpha/Beta/User.swift'];
     const targets = new Map([
       ['Alpha', 'Sources/Alpha'],
       ['Beta', 'Sources/Alpha/Beta'],
     ]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesByModule(files, id, cfg(targets));
 
-    expect(groups.get('Alpha')).toEqual(files);
-    expect(groups.has('Beta')).toBe(false);
+    expect(groups.get('Beta')).toEqual(files);
+    expect(groups.has('Alpha')).toBe(false);
+  });
+
+  it('matches target dirs from the repo root, not further down the path', () => {
+    // A target path is relative to its package; the loader rebases nested
+    // packages, so a vendored copy of the same layout is not this target.
+    const files = ['Vendor/Copy/Sources/Alpha/User.swift'];
+
+    const groups = groupSwiftFilesByModule(files, id, cfg(new Map([['Alpha', 'Sources/Alpha']])));
+
+    expect(groups.get('__default__')).toEqual(files);
   });
 
   it('assigns root-level files to a path: "." target', () => {
     const files = ['Lib.swift', 'Sources/Other/X.swift'];
     const targets = new Map([['Lib', '.']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesByModule(files, id, cfg(targets));
 
     expect(groups.get('Lib')).toEqual(files);
     expect(groups.has('__default__')).toBe(false);
@@ -75,7 +88,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
     const files = ['Sources/AlphaBeta/User.swift'];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesByModule(files, id, cfg(targets));
 
     expect(groups.has('Alpha')).toBe(false);
     expect(groups.get('__default__')).toEqual(files);
@@ -85,7 +98,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
     const files = ['Sources/Alpha/User.swift', 'Loose/Orphan.swift'];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesByModule(files, id, cfg(targets));
 
     expect(groups.get('Alpha')).toEqual(['Sources/Alpha/User.swift']);
     expect(groups.get('__default__')).toEqual(['Loose/Orphan.swift']);
@@ -94,7 +107,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
   it('routes ALL files to __default__ when targets is null (no source dir found)', () => {
     const files = ['Models/User.swift', 'Services/App.swift'];
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, null);
+    const groups = groupSwiftFilesByModule(files, id, cfg(null));
 
     expect([...groups.keys()]).toEqual(['__default__']);
     expect(groups.get('__default__')).toEqual(files);
@@ -103,7 +116,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
   it('routes ALL files to __default__ when targets is empty', () => {
     const files = ['Models/User.swift', 'Services/App.swift'];
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, new Map());
+    const groups = groupSwiftFilesByModule(files, id, cfg(new Map()));
 
     expect([...groups.keys()]).toEqual(['__default__']);
     expect(groups.get('__default__')).toEqual(files);
@@ -119,7 +132,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
       ['Beta', 'Sources/Beta'],
     ]);
 
-    const groups = groupSwiftFilesBySpmTarget(items, (i) => i.filePath, targets);
+    const groups = groupSwiftFilesByModule(items, (i) => i.filePath, cfg(targets));
 
     expect(groups.get('Alpha')).toEqual([items[0]]);
     expect(groups.get('Beta')).toEqual([items[1]]);
@@ -137,7 +150,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
       'Sources/Foundation/Thing.swift',
     ];
 
-    const groups = groupSwiftFilesBySpmTarget(items, id, targets);
+    const groups = groupSwiftFilesByModule(items, id, cfg(targets));
 
     expect(groups.get('App')).toEqual(['Sources/App/main.swift']);
     expect(groups.get('Models')).toEqual(['Sources/Models/User.swift']);
@@ -149,7 +162,7 @@ describe('groupSwiftFilesBySpmTarget — shared SPM bucketing contract', () => {
     const files = ['Sources\\Alpha\\Core\\User.swift'];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesByModule(files, id, cfg(targets));
 
     expect(groups.get('Alpha')).toEqual(files);
   });

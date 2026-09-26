@@ -5,13 +5,11 @@ import {
   type SymbolDefinition,
   type TypeRef,
 } from 'gitnexus-shared';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { populateSwiftTargetSiblings } from '../../../../src/core/ingestion/languages/swift/target-siblings.js';
 import { mirrorSwiftSiblingTypeBindings } from '../../../../src/core/ingestion/languages/swift/sibling-type-bindings.js';
-import { getMaxSwiftModuleFiles } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
 import type { ScopeResolutionIndexes } from '../../../../src/core/ingestion/model/scope-resolution-indexes.js';
 import type { WorkspaceResolutionIndex } from '../../../../src/core/ingestion/scope-resolution/workspace-index.js';
-import { _captureLogger } from '../../../../src/core/logger.js';
 
 const moduleId = (filePath: string) => `scope:${filePath}:module` as ScopeId;
 const classId = (filePath: string) => `scope:${filePath}:class` as ScopeId;
@@ -328,6 +326,8 @@ function makeIndexes(
       ]),
     },
     bindingAugmentations,
+    namespaceFqnBindings: new Map(),
+    accessibleNamespacesByScope: new Map(),
   } as unknown as ScopeResolutionIndexes;
 }
 
@@ -395,7 +395,7 @@ function qualifiedExtensionFixture(
   return { declaration, extension, entry, indexes, bindingAugmentations };
 }
 
-describe('Swift sibling passes — module file ceiling (#3355)', () => {
+describe('Swift sibling passes — one shared table per module (#3355)', () => {
   const stub = (filePath: string, typeBindings = new Map<string, TypeRef>()): ParsedFile => ({
     filePath,
     moduleScope: moduleId(filePath),
@@ -427,64 +427,72 @@ describe('Swift sibling passes — module file ceiling (#3355)', () => {
     ({
       moduleScopes: { byFilePath: new Map(files.map((f) => [f.filePath, f.moduleScope])) },
       bindingAugmentations: new Map(),
+      namespaceFqnBindings: new Map(),
+      namespaceTypeBindings: new Map(),
+      accessibleNamespacesByScope: new Map(),
     }) as unknown as ScopeResolutionIndexes;
+  const targets = {
+    targets: new Map([
+      ['A', 'Sources/A'],
+      ['B', 'Sources/B'],
+    ]),
+  };
 
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('shares declarations across a module at the ceiling', () => {
-    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '3');
-    const files = ['A.swift', 'BB.swift', 'CCC.swift'].map((p) => stub(p));
+  it('puts every member def in one table and grants each member access to it', () => {
+    const files = ['Sources/A/X.swift', 'Sources/A/YY.swift', 'Sources/B/Z.swift'].map((p) =>
+      stub(p),
+    );
     const indexes = siblingIndexes(files);
 
-    populateSwiftTargetSiblings(files, indexes, { fileContents: new Map() });
+    populateSwiftTargetSiblings(files, indexes, {
+      fileContents: new Map(),
+      resolutionConfig: targets,
+    });
 
-    expect(indexes.bindingAugmentations.size).toBe(3);
+    expect([...indexes.namespaceFqnBindings.keys()]).toEqual(['swift-module:A']);
+    expect([...indexes.namespaceFqnBindings.get('swift-module:A')!.keys()].sort()).toEqual([
+      'T17',
+      'T18',
+    ]);
+    expect(indexes.accessibleNamespacesByScope.get(moduleId('Sources/A/X.swift'))).toEqual([
+      'swift-module:A',
+    ]);
+    expect(indexes.accessibleNamespacesByScope.has(moduleId('Sources/B/Z.swift'))).toBe(false);
+    expect(indexes.bindingAugmentations.size).toBe(0);
   });
 
-  it('skips a module over the ceiling and warns', () => {
-    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '3');
-    const files = ['A.swift', 'BB.swift', 'CCC.swift', 'DDDD.swift'].map((p) => stub(p));
+  it('stays linear: one binding per def regardless of module size', () => {
+    const files = Array.from({ length: 200 }, (_, i) => stub(`Sources/A/F${i}.swift`));
     const indexes = siblingIndexes(files);
-    const cap = _captureLogger();
-    try {
-      populateSwiftTargetSiblings(files, indexes, { fileContents: new Map() });
-      expect(indexes.bindingAugmentations.size).toBe(0);
-      expect(cap.text()).toContain('target siblings: skipping module __default__ (4 files');
-    } finally {
-      cap.restore();
-    }
+
+    populateSwiftTargetSiblings(files, indexes, {
+      fileContents: new Map(),
+      resolutionConfig: targets,
+    });
+
+    const table = indexes.namespaceFqnBindings.get('swift-module:A')!;
+    const bindings = [...table.values()].reduce((n, refs) => n + refs.length, 0);
+    expect(bindings).toBe(200);
   });
 
-  it('skips type-binding mirroring for a module over the ceiling', () => {
-    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '1');
-    const source = stub('Source.swift', new Map([['x', { rawName: 'Box' } as TypeRef]]));
-    const importer = stub('Importer.swift');
+  it('mirrors sibling type bindings into the shared type table, first declaration wins', () => {
+    const first = stub('Sources/A/First.swift', new Map([['make', { rawName: 'Box' } as TypeRef]]));
+    const second = stub(
+      'Sources/A/Second.swift',
+      new Map([['make', { rawName: 'Crate' } as TypeRef]]),
+    );
+    const indexes = siblingIndexes([first, second]);
     const workspace = {
-      moduleScopeByFile: new Map(
-        [source, importer].map((f) => [f.filePath, f.scopes[0]!] as const),
-      ),
+      moduleScopeByFile: new Map([first, second].map((f) => [f.filePath, f.scopes[0]!] as const)),
     } as unknown as WorkspaceResolutionIndex;
-    const cap = _captureLogger();
-    try {
-      mirrorSwiftSiblingTypeBindings(
-        [source, importer],
-        {} as ScopeResolutionIndexes,
-        workspace,
-        null,
-      );
-      expect(importer.scopes[0]!.typeBindings.size).toBe(0);
-      expect(cap.text()).toContain('sibling type bindings: skipping module __default__ (2 files');
-    } finally {
-      cap.restore();
-    }
-  });
+    Object.assign(indexes, { scopeTree: { getScope: () => undefined } });
 
-  it('falls back to the default ceiling for an invalid override', () => {
-    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', 'abc');
-    expect(getMaxSwiftModuleFiles()).toBe(1_000);
-    vi.stubEnv('GITNEXUS_SWIFT_MAX_MODULE_FILES', '-1');
-    expect(getMaxSwiftModuleFiles()).toBe(1_000);
+    mirrorSwiftSiblingTypeBindings([first, second], indexes, workspace, targets);
+
+    expect(indexes.namespaceTypeBindings.get('swift-module:A')?.get('make')?.rawName).toBe('Box');
+    expect(second.scopes[0]!.typeBindings.get('make')?.rawName).toBe('Crate');
+    expect(indexes.accessibleNamespacesByScope.get(moduleId('Sources/A/Second.swift'))).toEqual([
+      'swift-module:A',
+    ]);
   });
 });

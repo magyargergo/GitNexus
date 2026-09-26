@@ -198,6 +198,37 @@ export interface SwiftPackageConfig {
    * binary-only Package.swift does not collapse every file into `__default__`.
    */
   declaredTargets?: Map<string, string>;
+  /**
+   * Every Swift module the workspace loader found (root and nested SwiftPM
+   * targets, Xcode native targets). When present it is the authority for
+   * module membership and `import` resolution; `targets` stays for callers
+   * that only know the SwiftPM map.
+   */
+  modules?: readonly SwiftModuleSpec[];
+  /**
+   * True when every manifest and Xcode project was read completely and no
+   * module was inferred from folder names, so a name missing from `modules`
+   * is an external module (SDK or dependency), not an unread local one.
+   */
+  moduleNamesComplete?: boolean;
+}
+
+/** One Swift module (compiler unit) found in the workspace. */
+export interface SwiftModuleSpec {
+  /** Stable key: a repo-relative SwiftPM target directory, or `xcode:<project>:<target>`. */
+  readonly key: string;
+  /** Module name as written in `import X`. */
+  readonly name: string;
+  /** SwiftPM: repo-relative target directory ('' is the repo root). */
+  readonly dir?: string;
+  /** Xcode: repo-relative member files. */
+  readonly files?: readonly string[];
+  /** Xcode: repo-relative synchronized folders; files below are members. */
+  readonly folders?: readonly string[];
+  /** Xcode: files excluded from this target's synchronized folders. */
+  readonly excluded?: readonly string[];
+  /** False for SwiftPM plugins: modules, but never `import`-able. */
+  readonly importable: boolean;
 }
 
 /**
@@ -662,8 +693,15 @@ async function collectDeclaredNamespaces(
   return structure.incomplete ? 'truncated' : 'ok';
 }
 
-const SWIFT_SOURCE_FACTORY_NAMES = ['target', 'executableTarget', 'testTarget', 'macro'] as const;
-const SWIFT_SKIP_FACTORY_NAMES = ['binaryTarget', 'plugin', 'systemLibrary'] as const;
+const SWIFT_SOURCE_FACTORY_NAMES = [
+  'target',
+  'executableTarget',
+  'testTarget',
+  'macro',
+  'plugin',
+] as const;
+/** No Swift sources: a prebuilt artifact or a C module map. */
+const SWIFT_SKIP_FACTORY_NAMES = ['binaryTarget', 'systemLibrary'] as const;
 const SWIFT_SKIP_FACTORIES = new Set<string>(SWIFT_SKIP_FACTORY_NAMES);
 const SWIFT_FACTORY_RE = new RegExp(
   `\\.(${[...SWIFT_SOURCE_FACTORY_NAMES, ...SWIFT_SKIP_FACTORY_NAMES].join('|')})\\s*\\(`,
@@ -999,14 +1037,30 @@ function swiftPathIsUnreadable(customPath: string | undefined, hasPathKey: boole
   return customPath === undefined || customPath === '' || customPath.includes('\\(');
 }
 
-/** Heuristic Package.swift scan. Never shells out to `swift package dump-package`. */
-export function parseSwiftPackageManifest(source: string): {
+/** Where SwiftPM looks for a target that declares no `path:`. */
+export type SwiftTargetDirKind = 'source' | 'test' | 'plugin';
+
+export interface SwiftManifestParse {
+  /** Target name -> package-relative directory. */
   targets: Map<string, string>;
+  /**
+   * Targets with no `path:`. Their directory above is the conventional
+   * default; `loadSwiftPackageConfig` replaces it with the directory SwiftPM
+   * would actually pick (`Sources`, `Source`, `src`, or `srcs`).
+   */
+  implicitDirs: Map<string, SwiftTargetDirKind>;
+  /** Plugin targets: modules for grouping, never `import`-able. */
+  plugins: Set<string>;
   complete: boolean;
-} {
+}
+
+/** Heuristic Package.swift scan. Never shells out to `swift package dump-package`. */
+export function parseSwiftPackageManifest(source: string): SwiftManifestParse {
   const targets = new Map<string, string>();
+  const implicitDirs = new Map<string, SwiftTargetDirKind>();
+  const plugins = new Set<string>();
   if (swiftManifestHasCompletenessHazard(source)) {
-    return { targets, complete: false };
+    return { targets, implicitDirs, plugins, complete: false };
   }
 
   const packageTargets = inspectSwiftPackageTargets(source);
@@ -1053,22 +1107,47 @@ export function parseSwiftPackageManifest(source: string): {
       sawUnreadableFactory = true;
       continue;
     }
-    const dir = customPath ?? (kind === 'testTarget' ? `Tests/${name}` : `Sources/${name}`);
+    const dirKind: SwiftTargetDirKind =
+      kind === 'testTarget' ? 'test' : kind === 'plugin' ? 'plugin' : 'source';
+    if (dirKind === 'plugin') plugins.add(name);
+    const dir = customPath ?? `${SWIFT_DEFAULT_TARGET_PARENT[dirKind]}/${name}`;
     const existing = targets.get(name);
     if (existing === undefined) {
       targets.set(name, dir);
-    } else if (customPath !== undefined && existing === `Sources/${name}`) {
+      if (customPath === undefined) implicitDirs.set(name, dirKind);
+    } else if (customPath !== undefined && implicitDirs.has(name)) {
       // A later `.target(name:path:)` wins over an earlier same-name
       // factory that only implied the default path.
       targets.set(name, customPath);
+      implicitDirs.delete(name);
     }
   }
 
   return {
     targets,
+    implicitDirs,
+    plugins,
     complete: !sawUnreadableFactory && !packageTargets.helperBuilt,
   };
 }
+
+/** Conventional parent of a target with no `path:`, before disk lookup. */
+const SWIFT_DEFAULT_TARGET_PARENT: Readonly<Record<SwiftTargetDirKind, string>> = {
+  source: 'Sources',
+  test: 'Tests',
+  plugin: 'Plugins',
+};
+
+/**
+ * SwiftPM's predefined parents, in its search order (`PackageBuilder`):
+ * sources in `Sources`, `Source`, `src`, `srcs`; tests in `Tests` first, then
+ * the source parents; plugins only in `Plugins`.
+ */
+const SWIFT_PREDEFINED_TARGET_PARENTS: Readonly<Record<SwiftTargetDirKind, readonly string[]>> = {
+  source: ['Sources', 'Source', 'src', 'srcs'],
+  test: ['Tests', 'Sources', 'Source', 'src', 'srcs'],
+  plugin: ['Plugins'],
+};
 
 interface SwiftPackageTargetsInspection {
   helperBuilt: boolean;
@@ -1427,7 +1506,7 @@ async function inferSwiftDirectoryTargets(
   packageDir = '',
 ): Promise<Map<string, string>> {
   const targets = new Map<string, string>();
-  const sourceDirs = ['Sources', 'Package/Sources', 'src'];
+  const sourceDirs = ['Sources', 'Source', 'Package/Sources', 'src', 'srcs'];
   for (const sourceDir of sourceDirs) {
     try {
       const fullPath = path.join(repoRoot, packageDir, sourceDir);
@@ -1453,26 +1532,30 @@ export async function loadSwiftPackageConfig(
   repoRoot: string,
   packageDir = '',
 ): Promise<SwiftPackageConfig | null> {
+  const pkgRoot = path.join(repoRoot, packageDir);
   try {
-    const source = await fs.readFile(path.join(repoRoot, packageDir, 'Package.swift'), 'utf-8');
+    const source = await fs.readFile(
+      path.join(pkgRoot, await pickSwiftManifestFile(pkgRoot)),
+      'utf-8',
+    );
     const parsed = parseSwiftPackageManifest(source);
     if (parsed.complete) {
       if (isDev) {
         logger.info(`📦 Loaded ${parsed.targets.size} Swift package targets from Package.swift`);
       }
+      for (const [name, kind] of parsed.implicitDirs) {
+        const dir = await findSwiftPredefinedTargetDir(pkgRoot, name, kind);
+        if (dir !== null) parsed.targets.set(name, dir);
+      }
+      // Plugins are modules (grouping) but never `import`-able.
+      const declaredTargets = new Map(
+        [...parsed.targets].filter(([name]) => !parsed.plugins.has(name)),
+      );
       if (parsed.targets.size > 0) {
-        return {
-          targets: parsed.targets,
-          origin: 'package.swift',
-          declaredTargets: parsed.targets,
-        };
+        return { targets: parsed.targets, origin: 'package.swift', declaredTargets };
       }
       const inferred = await inferSwiftDirectoryTargets(repoRoot, packageDir);
-      return {
-        targets: inferred,
-        origin: 'package.swift',
-        declaredTargets: parsed.targets,
-      };
+      return { targets: inferred, origin: 'package.swift', declaredTargets };
     }
   } catch {
     // Missing or unreadable — fall through to inferred folders.
@@ -1488,110 +1571,58 @@ export async function loadSwiftPackageConfig(
   return null;
 }
 
-/** Bounds for the Swift package walk, same as the Zig one. */
-const SWIFT_SCAN_MAX_DIRS = 20_000;
-const SWIFT_SCAN_MAX_DEPTH = 24;
-
-/** Xcode bundle directories: never hold a manifest, often numerous. */
-const SWIFT_SKIPPED_DIR_SUFFIXES = ['.xcassets', '.xcodeproj', '.xcworkspace', '.lproj', '.bundle'];
+const SWIFT_VERSIONED_MANIFEST_RE = /^Package@swift-(\d+)(?:\.(\d+))?(?:\.(\d+))?\.swift$/;
 
 /**
- * The root config plus every nested SwiftPM package's targets (#3355).
- *
- * `loadSwiftPackageConfig` reads only the root package. A monorepo laid out as
- * `Core/<pkg>/Package.swift` has no root manifest and no root `Sources/`, so it
- * answers null and every Swift file lands in one `__default__` module — every
- * file then "sees" every other, and the implicit-import pass emits n² edges.
- *
- * Nested targets are keyed by their repo-relative directory, so two packages
- * declaring the same target name stay two modules. They feed grouping only:
- * `origin` and `declaredTargets` stay the root's, so explicit `import X`
- * resolution is unchanged (nested modules resolve through the segment index).
- *
- * Called from `ScopeResolver.loadResolutionConfig`, so only repos with Swift
- * pay for the walk — the same split as `loadZigWorkspaceIndex`.
+ * The manifest SwiftPM would read in `pkgRoot`. A `Package@swift-X.Y.swift`
+ * overrides `Package.swift` for toolchains at or above X.Y; the toolchain is
+ * unknown here, so assume the newest and take the highest version present.
  */
-export async function loadSwiftWorkspaceConfig(
-  repoRoot: string,
-): Promise<SwiftPackageConfig | null> {
-  const root = await loadSwiftPackageConfig(repoRoot);
-  const nested = new Map<string, string>();
-  for (const dir of await findSwiftPackageDirs(repoRoot)) {
-    const config = await loadSwiftPackageConfig(repoRoot, dir);
-    if (config === null) continue;
-    for (const targetDir of config.targets.values()) {
-      // Same rebase-and-reject-escapes rule as Zig path deps. An empty result
-      // is the repo root, whose prefix would match every file.
-      if (isAbsoluteZigDepPath(targetDir)) continue;
-      const joined = normalizeZigDepPath(`${dir}/${targetDir}`);
-      if (joined === null || joined === '') continue;
-      nested.set(joined, joined);
+async function pickSwiftManifestFile(pkgRoot: string): Promise<string> {
+  let best = 'Package.swift';
+  let bestVersion: readonly number[] = [];
+  let names: string[];
+  try {
+    names = await fs.readdir(pkgRoot);
+  } catch {
+    return best;
+  }
+  for (const name of names) {
+    const m = SWIFT_VERSIONED_MANIFEST_RE.exec(name);
+    if (m === null) continue;
+    const version = [Number(m[1]), Number(m[2] ?? 0), Number(m[3] ?? 0)];
+    if (compareVersions(version, bestVersion) > 0) {
+      best = name;
+      bestVersion = version;
     }
   }
-  if (nested.size === 0) return root;
-
-  // Deepest first, then the root's targets: grouping is first-match, and a
-  // root `Sources/Core` also matches `Features/A/Sources/Core/…` at a segment
-  // boundary, so the more specific nested target must come first.
-  const targets = new Map(
-    [...nested].sort(([a], [b]) => b.length - a.length || a.localeCompare(b)),
-  );
-  for (const [name, dir] of root?.targets ?? []) {
-    if (!targets.has(name)) targets.set(name, dir);
-  }
-  if (isDev) {
-    logger.info(`📦 Found ${nested.size} Swift targets in nested Package.swift manifests`);
-  }
-  return root === null ? { targets, origin: 'directories' } : { ...root, targets };
+  return best;
 }
 
-/** Repo-relative directories below the root that hold a `Package.swift`. */
-async function findSwiftPackageDirs(repoRoot: string): Promise<string[]> {
-  const found: string[] = [];
-  const queue: { dir: string; depth: number }[] = [{ dir: repoRoot, depth: 0 }];
-  // Head index, not `queue.shift()` — see `findZigPackageDirs`.
-  let queueHead = 0;
-  let truncated = false;
+function compareVersions(a: readonly number[], b: readonly number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? -1) - (b[i] ?? -1);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
 
-  while (queueHead < queue.length) {
-    if (queueHead >= SWIFT_SCAN_MAX_DIRS) {
-      truncated = true;
-      break;
-    }
-    const { dir, depth } = queue[queueHead++]!;
-    let entries: import('fs').Dirent[];
+/** First predefined `<parent>/<name>` directory that exists, else null. */
+async function findSwiftPredefinedTargetDir(
+  pkgRoot: string,
+  name: string,
+  kind: SwiftTargetDirKind,
+): Promise<string | null> {
+  for (const parent of SWIFT_PREDEFINED_TARGET_PARENTS[kind]) {
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    // Sorted so the directories a capped walk reaches do not depend on the
-    // filesystem's listing order.
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const name = entry.name;
-        if (name.startsWith('.')) continue;
-        if (SWIFT_SKIPPED_DIR_SUFFIXES.some((suffix) => name.endsWith(suffix))) continue;
-        const childDir = path.join(dir, name);
-        if (isHardcodedIgnoredDirectoryAtPath(repoRoot, childDir)) continue;
-        if (depth >= SWIFT_SCAN_MAX_DEPTH) {
-          truncated = true;
-          continue;
-        }
-        queue.push({ dir: childDir, depth: depth + 1 });
-      } else if (entry.isFile() && entry.name === 'Package.swift' && dir !== repoRoot) {
-        found.push(path.relative(repoRoot, dir).split(path.sep).join('/'));
+      if ((await fs.stat(path.join(pkgRoot, parent, name))).isDirectory()) {
+        return `${parent}/${name}`;
       }
+    } catch {
+      // Not there — try the next predefined parent.
     }
   }
-
-  if (truncated) {
-    logger.warn(
-      `[swift] Package.swift scan of ${repoRoot} truncated (dir cap ${SWIFT_SCAN_MAX_DIRS}, depth cap ${SWIFT_SCAN_MAX_DEPTH}); files of packages past the cap group into __default__`,
-    );
-  }
-  return found;
+  return null;
 }
 
 /**
@@ -1917,7 +1948,7 @@ async function findZigPackageDirs(repoRoot: string): Promise<string[]> {
  * nested-package branch exists to do; `normalizeZigDepPath` rejects the ones
  * that still escape the ROOT after rebasing.
  */
-function isAbsoluteZigDepPath(depPath: string): boolean {
+export function isAbsoluteZigDepPath(depPath: string): boolean {
   const normalized = depPath.replace(/\\/g, '/');
   return normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized);
 }

@@ -19,8 +19,21 @@ import {
 } from './helpers.js';
 import { isLanguageAvailable } from '../../../src/core/tree-sitter/parser-loader.js';
 import { SupportedLanguages } from '../../../src/config/supported-languages.js';
+import { MODULE_MEMBERSHIP_REASON } from '../../../src/core/graph/edge-reasons.js';
 
 const swiftAvailable = isLanguageAvailable(SupportedLanguages.Swift);
+
+/**
+ * Module nodes a file is a member of. Same-module visibility is one
+ * File -> Module membership edge per file (#3355), so two files see each
+ * other exactly when they share a hub.
+ */
+function moduleHubsOf(result: PipelineResult, filePath: string): string[] {
+  return getRelationships(result, 'IMPORTS')
+    .filter((c) => c.rel.reason === MODULE_MEMBERSHIP_REASON && c.sourceFilePath === filePath)
+    .map((c) => c.rel.targetId)
+    .sort();
+}
 
 describe.skipIf(!swiftAvailable)('Swift constructor-inferred type resolution', () => {
   let result: PipelineResult;
@@ -262,14 +275,9 @@ describe.skipIf(!swiftAvailable)('Swift implicit imports (cross-file visibility)
     expect(memberCall).toBeDefined();
   });
 
-  it('creates IMPORTS edges between files in the same module', () => {
-    const imports = getRelationships(result, 'IMPORTS');
-    const crossFileImport = imports.find(
-      (c) =>
-        (c.sourceFilePath === 'App.swift' && c.targetFilePath === 'Models.swift') ||
-        (c.sourceFilePath === 'Models.swift' && c.targetFilePath === 'App.swift'),
-    );
-    expect(crossFileImport).toBeDefined();
+  it('makes files in the same module members of one Module hub', () => {
+    expect(moduleHubsOf(result, 'App.swift')).toHaveLength(1);
+    expect(moduleHubsOf(result, 'App.swift')).toEqual(moduleHubsOf(result, 'Models.swift'));
   });
 });
 
@@ -985,20 +993,11 @@ describe.skipIf(!swiftAvailable)('Swift SPM multi-directory target grouping', ()
     expect(memberCall!.targetFilePath).toBe('Sources/Alpha/Core/User.swift');
   });
 
-  it('emits cross-directory IMPORTS edges within the Alpha target (Entry <-> Core)', () => {
-    const imports = getRelationships(result, 'IMPORTS');
-    const entryToCore = imports.find(
-      (c) =>
-        c.sourceFilePath === 'Sources/Alpha/Entry/App.swift' &&
-        c.targetFilePath === 'Sources/Alpha/Core/User.swift',
-    );
-    const coreToEntry = imports.find(
-      (c) =>
-        c.sourceFilePath === 'Sources/Alpha/Core/User.swift' &&
-        c.targetFilePath === 'Sources/Alpha/Entry/App.swift',
-    );
-    expect(entryToCore).toBeDefined();
-    expect(coreToEntry).toBeDefined();
+  it('puts both directories of the Alpha target in one module (Entry <-> Core)', () => {
+    const entry = moduleHubsOf(result, 'Sources/Alpha/Entry/App.swift');
+    expect(entry).toHaveLength(1);
+    expect(entry).toEqual(moduleHubsOf(result, 'Sources/Alpha/Core/User.swift'));
+    expect(entry).not.toEqual(moduleHubsOf(result, 'Sources/Beta/Core/User.swift'));
   });
 
   it('does NOT emit IMPORTS across distinct targets (no Alpha <-> Beta)', () => {
@@ -1054,14 +1053,11 @@ describe.skipIf(!swiftAvailable)(
       expect(memberCall!.targetFilePath).toBe('Models/User.swift');
     });
 
-    it('emits cross-folder IMPORTS edges between Models and Services', () => {
-      const imports = getRelationships(result, 'IMPORTS');
-      const crossFolder = imports.find(
-        (c) =>
-          (c.sourceFilePath === 'Services/App.swift' && c.targetFilePath === 'Models/User.swift') ||
-          (c.sourceFilePath === 'Models/User.swift' && c.targetFilePath === 'Services/App.swift'),
+    it('puts Models and Services in one __default__ module', () => {
+      expect(moduleHubsOf(result, 'Services/App.swift')).toHaveLength(1);
+      expect(moduleHubsOf(result, 'Services/App.swift')).toEqual(
+        moduleHubsOf(result, 'Models/User.swift'),
       );
-      expect(crossFolder).toBeDefined();
     });
   },
 );
@@ -1077,29 +1073,41 @@ describe.skipIf(!swiftAvailable)('Swift nested packages (no root Package.swift)'
   const login = 'Features/Login/Sources/Login';
   const otherNet = 'Features/Other/Sources/Net';
   const coreNet = 'Core/Net/Sources/Net';
-  const packageOf = (filePath: string): string => filePath.split('/Sources/')[0]!;
 
   beforeAll(async () => {
     result = await runPipelineFromRepo(path.join(FIXTURES, 'swift-nested-packages'), () => {});
   }, 60000);
 
-  it('emits implicit IMPORTS between files of the same target', () => {
-    const imports = getRelationships(result, 'IMPORTS').map(
-      (c) => `${c.sourceFilePath}->${c.targetFilePath}`,
+  it('puts files of the same target in one module', () => {
+    expect(moduleHubsOf(result, `${coreNet}/Session.swift`)).toHaveLength(1);
+    expect(moduleHubsOf(result, `${coreNet}/Session.swift`)).toEqual(
+      moduleHubsOf(result, `${coreNet}/Client.swift`),
     );
-    expect(imports).toContain(`${coreNet}/Session.swift->${coreNet}/Client.swift`);
-    expect(imports).toContain(`${login}/LoginFlow.swift->${login}/Config.swift`);
+    expect(moduleHubsOf(result, `${login}/LoginFlow.swift`)).toEqual(
+      moduleHubsOf(result, `${login}/Config.swift`),
+    );
   });
 
-  it('emits no implicit IMPORTS across packages, including same-named targets', () => {
-    const crossPackage = getRelationships(result, 'IMPORTS').filter(
-      (c) =>
-        // Manifests belong to no target and share `__default__`, as before.
-        c.sourceFilePath.includes('/Sources/') &&
-        c.targetFilePath.includes('/Sources/') &&
-        packageOf(c.sourceFilePath) !== packageOf(c.targetFilePath),
-    );
-    expect(crossPackage).toEqual([]);
+  it('keeps every package in its own module, including same-named targets', () => {
+    const hubs = [
+      `${coreNet}/Client.swift`,
+      `${otherNet}/Config.swift`,
+      `${login}/Config.swift`,
+    ].map((file) => moduleHubsOf(result, file).join());
+    expect(new Set(hubs).size).toBe(3);
+  });
+
+  it('resolves `import Net` by module name, not by a folder that happens to be named Net', () => {
+    const imported = getRelationships(result, 'IMPORTS')
+      .filter((c) => c.sourceFilePath === `${login}/Connect.swift` && c.targetLabel === 'File')
+      .map((c) => c.targetFilePath)
+      .sort();
+    expect(imported).toEqual([
+      `${coreNet}/Client.swift`,
+      `${coreNet}/Session.swift`,
+      `${otherNet}/Config.swift`,
+      `${otherNet}/Use.swift`,
+    ]);
   });
 
   it("resolves Config() to the caller's own package", () => {
@@ -1109,6 +1117,36 @@ describe.skipIf(!swiftAvailable)('Swift nested packages (no root Package.swift)'
     expect(ctorCalls.map((c) => `${c.sourceFilePath}->${c.targetFilePath}`).sort()).toEqual([
       `${login}/LoginFlow.swift->${login}/Config.swift`,
       `${otherNet}/Use.swift->${otherNet}/Config.swift`,
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #3355 — Xcode native targets from project.pbxproj. The app and its widget
+// extension are separate modules that each declare a `Config` class.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift Xcode targets (project.pbxproj)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'swift-xcode-targets'), () => {});
+  }, 60000);
+
+  it('makes each Xcode target its own module', () => {
+    const app = moduleHubsOf(result, 'App/AppMain.swift');
+    expect(app).toHaveLength(1);
+    expect(app).toEqual(moduleHubsOf(result, 'App/Config.swift'));
+    expect(app).not.toEqual(moduleHubsOf(result, 'Widget/WidgetMain.swift'));
+  });
+
+  it("resolves Config() to the caller's own target", () => {
+    const ctorCalls = getRelationships(result, 'CALLS').filter(
+      (c) => c.target === 'Config' && c.targetLabel === 'Class',
+    );
+    expect(ctorCalls.map((c) => `${c.sourceFilePath}->${c.targetFilePath}`).sort()).toEqual([
+      'App/AppMain.swift->App/Config.swift',
+      'Widget/WidgetMain.swift->Widget/Config.swift',
     ]);
   });
 });

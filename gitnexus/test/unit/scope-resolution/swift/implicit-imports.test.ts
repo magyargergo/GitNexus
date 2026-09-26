@@ -9,9 +9,9 @@ import { createKnowledgeGraph } from '../../../../src/core/graph/graph.js';
 import { generateId } from '../../../../src/lib/utils.js';
 import {
   emitSwiftImplicitImportEdges,
-  MAX_SWIFT_IMPLICIT_IMPORT_EDGES,
+  swiftModuleNodeId,
 } from '../../../../src/core/ingestion/languages/swift/implicit-imports.js';
-import { _captureLogger } from '../../../../src/core/logger.js';
+import { MODULE_MEMBERSHIP_REASON } from '../../../../src/core/graph/edge-reasons.js';
 import { resolveSwiftImportTarget } from '../../../../src/core/ingestion/languages/swift/import-target.js';
 
 const DECLARED = {
@@ -59,11 +59,9 @@ describe('emitSwiftImplicitImportEdges', () => {
     emitSwiftImplicitImportEdges(graph, parsed, new Map(), DECLARED);
 
     const pairs = importPair(graph.relationships);
+    const hubA = swiftModuleNodeId('A');
     expect(pairs).toEqual(
-      [
-        `${generateId('File', a)}->${generateId('File', other)}`,
-        `${generateId('File', other)}->${generateId('File', a)}`,
-      ].sort(),
+      [`${generateId('File', a)}->${hubA}`, `${generateId('File', other)}->${hubA}`].sort(),
     );
     expect(pairs.some((pair) => pair.includes(generateId('File', b)))).toBe(false);
 
@@ -77,54 +75,92 @@ describe('emitSwiftImplicitImportEdges', () => {
   });
 });
 
-describe('emitSwiftImplicitImportEdges — total edge budget (#3355)', () => {
+describe('emitSwiftImplicitImportEdges — one Module hub per module (#3355)', () => {
   const files = (dir: string, n: number): ParsedFile[] =>
     Array.from({ length: n }, (_, i) => stubFile(`${dir}/F${i}.swift`));
-  const importCount = (graph: ReturnType<typeof createKnowledgeGraph>): number =>
-    graph.relationships.filter((rel) => rel.type === 'IMPORTS').length;
 
-  it('stays under a quarter of the V8 Map limit by default', () => {
-    expect(MAX_SWIFT_IMPLICIT_IMPORT_EDGES).toBeLessThanOrEqual(2 ** 24 / 4);
-  });
-
-  it('emits every pair of a module that fits the budget', () => {
+  it('emits one Module node and one membership edge per member file', () => {
     const graph = createKnowledgeGraph();
-    emitSwiftImplicitImportEdges(graph, files('Sources/A', 4), new Map(), DECLARED, 12);
-    expect(importCount(graph)).toBe(12);
+    emitSwiftImplicitImportEdges(graph, files('Sources/A', 4), new Map(), DECLARED);
+
+    const edges = graph.relationships.filter((rel) => rel.type === 'IMPORTS');
+    expect(edges).toHaveLength(4);
+    expect(edges.every((rel) => rel.targetId === swiftModuleNodeId('A'))).toBe(true);
+    expect(edges.every((rel) => rel.reason === MODULE_MEMBERSHIP_REASON)).toBe(true);
+    expect(graph.getNode(swiftModuleNodeId('A'))).toMatchObject({
+      label: 'Module',
+      properties: { name: 'A', filePath: 'Sources/A' },
+    });
   });
 
-  it('skips a module over the budget and names it in a warning', () => {
+  it('stays linear in module size where the pairwise form would exceed the Map limit', () => {
     const graph = createKnowledgeGraph();
-    const cap = _captureLogger();
-    try {
-      emitSwiftImplicitImportEdges(graph, files('App', 5), new Map(), null, 12);
-      expect(importCount(graph)).toBe(0);
-      expect(cap.text()).toContain('module __default__ (5 files');
-    } finally {
-      cap.restore();
-    }
+    // 5,000 files: pairwise would be ~25M edges, over V8's 2^24 Map entries.
+    emitSwiftImplicitImportEdges(graph, files('App', 5000), new Map(), null);
+
+    expect(graph.relationships.filter((rel) => rel.type === 'IMPORTS')).toHaveLength(5000);
+    expect(graph.getNode(swiftModuleNodeId('__default__'))).toMatchObject({
+      properties: { name: '__default__', filePath: '.' },
+    });
   });
 
-  it('bounds the total across modules, filling smallest modules first', () => {
+  it('skips single-file modules and keeps modules apart', () => {
+    const graph = createKnowledgeGraph();
+    emitSwiftImplicitImportEdges(
+      graph,
+      [...files('Sources/A', 2), ...files('Sources/B', 1)],
+      new Map(),
+      DECLARED,
+    );
+
+    expect(importPair(graph.relationships)).toEqual(
+      [
+        `${generateId('File', 'Sources/A/F0.swift')}->${swiftModuleNodeId('A')}`,
+        `${generateId('File', 'Sources/A/F1.swift')}->${swiftModuleNodeId('A')}`,
+      ].sort(),
+    );
+    expect(graph.getNode(swiftModuleNodeId('B'))).toBeUndefined();
+  });
+
+  it('links a file compiled into two Xcode targets to both modules', () => {
+    const shared = 'App/Shared.swift';
     const config = {
-      origin: 'directories' as const,
-      targets: new Map([
-        ['A', 'Sources/A'],
-        ['B', 'Sources/B'],
-        ['C', 'Sources/C'],
-      ]),
+      targets: new Map(),
+      modules: [
+        {
+          key: 'xcode:App.xcodeproj:App',
+          name: 'App',
+          files: [shared, 'App/Main.swift'],
+          importable: true,
+        },
+        {
+          key: 'xcode:App.xcodeproj:Widget',
+          name: 'Widget',
+          files: [shared, 'App/Widget.swift'],
+          importable: true,
+        },
+      ],
     };
-    const parsed = [...files('Sources/A', 3), ...files('Sources/B', 3), ...files('Sources/C', 2)];
     const graph = createKnowledgeGraph();
-    const cap = _captureLogger();
-    try {
-      // 6 + 2 fit a budget of 12; the second 3-file module (6 more) does not.
-      emitSwiftImplicitImportEdges(graph, parsed, new Map(), config, 12);
-      expect(importCount(graph)).toBe(8);
-      expect(cap.text()).toContain('module B (3 files');
-      expect(cap.text()).not.toContain('module A (');
-    } finally {
-      cap.restore();
-    }
+    emitSwiftImplicitImportEdges(
+      graph,
+      [stubFile(shared), stubFile('App/Main.swift'), stubFile('App/Widget.swift')],
+      new Map(),
+      config,
+    );
+
+    const fromShared = graph.relationships
+      .filter((rel) => rel.sourceId === generateId('File', shared))
+      .map((rel) => rel.targetId)
+      .sort();
+    expect(fromShared).toEqual(
+      [
+        swiftModuleNodeId('xcode:App.xcodeproj:App'),
+        swiftModuleNodeId('xcode:App.xcodeproj:Widget'),
+      ].sort(),
+    );
+    expect(graph.getNode(swiftModuleNodeId('xcode:App.xcodeproj:App'))).toMatchObject({
+      properties: { filePath: 'App.xcodeproj' },
+    });
   });
 });

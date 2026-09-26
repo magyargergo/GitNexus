@@ -12,15 +12,16 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   loadSwiftPackageConfig,
-  loadSwiftWorkspaceConfig,
   parseSwiftPackageManifest,
+  type SwiftPackageConfig,
   swiftDeclaredTargetPrefix,
 } from '../../../../src/core/ingestion/language-config.js';
 import {
   coerceDeclaredSwiftTargets,
-  coerceSwiftTargets,
-  groupSwiftFilesBySpmTarget,
+  groupSwiftFilesByModule,
 } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
+import { loadSwiftWorkspaceConfig } from '../../../../src/core/ingestion/languages/swift/workspace-config.js';
+import { parseXcodeProject } from '../../../../src/core/ingestion/languages/swift/xcode-project.js';
 import { _captureLogger } from '../../../../src/core/logger.js';
 
 const roots: string[] = [];
@@ -79,14 +80,20 @@ describe('parseSwiftPackageManifest', () => {
     expect(parsed.targets.get('AppTests')).toBe('Tests/AppTests');
   });
 
-  it('skips binary / plugin / systemLibrary targets', () => {
+  it('skips binary / systemLibrary targets, which have no Swift sources', () => {
     const parsed = parseSwiftPackageManifest(`
       .binaryTarget(name: "Lib", path: "Lib.xcframework")
-      .plugin(name: "Gen")
       .systemLibrary(name: "CFoo")
     `);
     expect(parsed.complete).toBe(true);
     expect(parsed.targets.size).toBe(0);
+  });
+
+  it('keeps plugin targets as modules under Plugins/, marked non-importable', () => {
+    const parsed = parseSwiftPackageManifest(`.plugin(name: "Gen", capability: .buildTool())`);
+    expect(parsed.targets.get('Gen')).toBe('Plugins/Gen');
+    expect([...parsed.plugins]).toEqual(['Gen']);
+    expect(parsed.implicitDirs.get('Gen')).toBe('plugin');
   });
 
   it('treats #if as a completeness hazard', () => {
@@ -460,7 +467,52 @@ let package = Package(
 const pkg = (...targets: string[]): string =>
   `let package = Package(name: "P", targets: [${targets.join(', ')}])`;
 
-describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', () => {
+const moduleKeys = (cfg: SwiftPackageConfig | null): string[] =>
+  (cfg?.modules ?? []).map((m) => m.key).sort();
+
+describe('loadSwiftPackageConfig — SwiftPM directory rules', () => {
+  it('finds a target in whichever predefined parent exists (Sources, Source, src, srcs)', async () => {
+    const root = repo({
+      'Package.swift': pkg(
+        '.target(name: "A")',
+        '.target(name: "B")',
+        '.testTarget(name: "BTests")',
+      ),
+      'Source/A/a.swift': '',
+      'srcs/B/b.swift': '',
+      'Tests/BTests/t.swift': '',
+    });
+
+    const cfg = await loadSwiftPackageConfig(root);
+
+    expect(cfg?.targets.get('A')).toBe('Source/A');
+    expect(cfg?.targets.get('B')).toBe('srcs/B');
+    expect(cfg?.targets.get('BTests')).toBe('Tests/BTests');
+  });
+
+  it('reads the highest Package@swift-X.Y.swift over Package.swift', async () => {
+    const root = repo({
+      'Package.swift': pkg('.target(name: "Old")'),
+      'Package@swift-5.9.swift': pkg('.target(name: "New59")'),
+      'Package@swift-5.10.swift': pkg('.target(name: "New510")'),
+    });
+
+    const cfg = await loadSwiftPackageConfig(root);
+
+    expect([...cfg!.targets.keys()]).toEqual(['New510']);
+  });
+
+  it('groups plugins but keeps them out of the import declaration map', async () => {
+    const root = repo({ 'Package.swift': pkg('.target(name: "Lib")', '.plugin(name: "Gen")') });
+
+    const cfg = await loadSwiftPackageConfig(root);
+
+    expect(cfg?.targets.get('Gen')).toBe('Plugins/Gen');
+    expect([...cfg!.declaredTargets!.keys()]).toEqual(['Lib']);
+  });
+});
+
+describe('loadSwiftWorkspaceConfig — nested packages and Xcode projects (#3355)', () => {
   it('adds each nested package target keyed by its repo-relative directory', async () => {
     const root = repo({
       'Core/Net/Package.swift': pkg('.target(name: "Net")'),
@@ -475,11 +527,16 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
     const cfg = await loadSwiftWorkspaceConfig(root);
 
     expect(cfg?.origin).toBe('directories');
-    expect([...cfg!.targets.keys()].sort()).toEqual([
+    expect(moduleKeys(cfg)).toEqual([
       'Core/Net/Sources/Net',
       'Features/Login/Sources/Login',
       'Features/Login/Tests/LoginTests',
     ]);
+    expect(cfg?.modules?.find((m) => m.key === 'Core/Net/Sources/Net')).toMatchObject({
+      name: 'Net',
+      importable: true,
+    });
+    expect(cfg?.moduleNamesComplete).toBe(true);
     expect(coerceDeclaredSwiftTargets(cfg)).toBeNull();
   });
 
@@ -490,10 +547,10 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
     });
 
     const cfg = await loadSwiftWorkspaceConfig(root);
-    const groups = groupSwiftFilesBySpmTarget(
+    const groups = groupSwiftFilesByModule(
       ['Core/A/Sources/Core/X.swift', 'Core/B/Sources/Core/Y.swift'],
       (p) => p,
-      coerceSwiftTargets(cfg),
+      cfg,
     );
 
     expect(groups.get('Core/A/Sources/Core')).toEqual(['Core/A/Sources/Core/X.swift']);
@@ -507,17 +564,17 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
     });
 
     const cfg = await loadSwiftWorkspaceConfig(root);
-    const groups = groupSwiftFilesBySpmTarget(
+    const groups = groupSwiftFilesByModule(
       ['Sources/Core/Root.swift', 'Features/A/Sources/Core/Nested.swift'],
       (p) => p,
-      coerceSwiftTargets(cfg),
+      cfg,
     );
 
-    expect(groups.get('Core')).toEqual(['Sources/Core/Root.swift']);
+    expect(groups.get('Sources/Core')).toEqual(['Sources/Core/Root.swift']);
     expect(groups.get('Features/A/Sources/Core')).toEqual(['Features/A/Sources/Core/Nested.swift']);
   });
 
-  it('keeps the root declaration as the only import-resolution map', async () => {
+  it('keeps the root declaration for legacy callers and lists every module', async () => {
     const root = repo({
       'Package.swift': MODELS_APP,
       'Features/Login/Package.swift': pkg('.target(name: "Login")'),
@@ -526,12 +583,11 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
     const cfg = await loadSwiftWorkspaceConfig(root);
 
     expect(cfg?.origin).toBe('package.swift');
-    expect([...cfg!.declaredTargets!.keys()].sort()).toEqual(['App', 'Models']);
     expect([...coerceDeclaredSwiftTargets(cfg)!.keys()].sort()).toEqual(['App', 'Models']);
-    expect([...cfg!.targets.keys()].sort()).toEqual([
-      'App',
+    expect(moduleKeys(cfg)).toEqual([
       'Features/Login/Sources/Login',
-      'Models',
+      'Sources/App',
+      'Sources/Models',
     ]);
   });
 
@@ -548,10 +604,10 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
 
     const cfg = await loadSwiftWorkspaceConfig(root);
 
-    expect([...cfg!.targets.keys()].sort()).toEqual(['Pkgs/Lib/Code', 'Pkgs/Shared']);
+    expect(moduleKeys(cfg)).toEqual(['Pkgs/Lib/Code', 'Pkgs/Shared']);
   });
 
-  it('infers Sources/* folders for a nested manifest with a completeness hazard', async () => {
+  it('infers Sources/* folders for a hazardous nested manifest and marks names incomplete', async () => {
     const root = repo({
       'Core/Hazard/Package.swift': '#if os(Linux)\n.target(name: "L")\n#endif\n',
       'Core/Hazard/Sources/App/main.swift': '',
@@ -559,10 +615,11 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
 
     const cfg = await loadSwiftWorkspaceConfig(root);
 
-    expect([...cfg!.targets.keys()]).toEqual(['Core/Hazard/Sources/App']);
+    expect(moduleKeys(cfg)).toEqual(['Core/Hazard/Sources/App']);
+    expect(cfg?.moduleNamesComplete).toBe(false);
   });
 
-  it('skips manifests under build output, dependencies, and every Xcode bundle suffix', async () => {
+  it('skips manifests under build output, dependencies, and bundle directories', async () => {
     const root = repo({
       '.build/checkouts/Dep/Package.swift': pkg('.target(name: "Dep")'),
       'node_modules/x/Package.swift': pkg('.target(name: "X")'),
@@ -576,7 +633,22 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
 
     const cfg = await loadSwiftWorkspaceConfig(root);
 
-    expect([...cfg!.targets.keys()]).toEqual(['Core/Real/Sources/Real']);
+    expect(moduleKeys(cfg)).toEqual(['Core/Real/Sources/Real']);
+  });
+
+  it('reads Xcode target membership and marks names incomplete when a project is unreadable', async () => {
+    const root = repo({
+      'App/App.xcodeproj/project.pbxproj': PBXPROJ,
+      'App/Broken.xcodeproj/project.pbxproj': '{ objects = {',
+    });
+
+    const cfg = await loadSwiftWorkspaceConfig(root);
+
+    expect(cfg?.modules?.find((m) => m.name === 'App')).toMatchObject({
+      key: 'xcode:App/App.xcodeproj:App',
+      files: ['App/App/AppMain.swift', 'App/Shared/Util.swift'],
+    });
+    expect(cfg?.moduleNamesComplete).toBe(false);
   });
 
   it('warns and keeps shallower packages when the walk passes the depth cap', async () => {
@@ -589,20 +661,74 @@ describe('loadSwiftWorkspaceConfig — nested Package.swift manifests (#3355)', 
     const cap = _captureLogger();
     try {
       const cfg = await loadSwiftWorkspaceConfig(root);
-      expect([...cfg!.targets.keys()]).toEqual(['Core/Shallow/Sources/Shallow']);
-      expect(cap.text()).toContain('Package.swift scan');
+      expect(moduleKeys(cfg)).toEqual(['Core/Shallow/Sources/Shallow']);
+      expect(cfg?.moduleNamesComplete).toBe(false);
+      expect(cap.text()).toContain('workspace scan');
     } finally {
       cap.restore();
     }
   });
 
-  it('returns the root config unchanged when no nested package exists', async () => {
-    const root = repo({ 'Sources/App/main.swift': '' });
-    expect(await loadSwiftWorkspaceConfig(root)).toEqual(await loadSwiftPackageConfig(root));
-  });
-
-  it('returns null with no manifest and no source folders anywhere', async () => {
+  it('returns null with no manifest, project, or source folders anywhere', async () => {
     const root = repo({ 'README.md': '' });
     expect(await loadSwiftWorkspaceConfig(root)).toBeNull();
   });
 });
+
+describe('parseXcodeProject', () => {
+  it('resolves group paths, SOURCE_ROOT references, and synchronized folders with exceptions', () => {
+    const parsed = parseXcodeProject(PBXPROJ, 'App');
+
+    expect(parsed.complete).toBe(true);
+    expect(parsed.targets).toEqual([
+      {
+        name: 'App',
+        files: ['App/App/AppMain.swift', 'App/Shared/Util.swift'],
+        folders: [],
+        excluded: [],
+      },
+      {
+        name: 'Widget',
+        files: ['App/Shared/Util.swift'],
+        folders: ['App/Widget'],
+        excluded: ['App/Widget/Preview.swift'],
+      },
+    ]);
+  });
+
+  it('reports an unparseable project as incomplete', () => {
+    expect(parseXcodeProject('{ objects = ', '')).toEqual({ targets: [], complete: false });
+  });
+});
+
+/**
+ * Two targets: `App` via a classic sources phase (one `<group>` file, one
+ * `SOURCE_ROOT` file, one SDK framework that must be ignored), and `Widget`
+ * via an Xcode 16 synchronized folder with a membership exception, plus the
+ * shared SOURCE_ROOT file.
+ */
+const PBXPROJ = `// !$*UTF8*$!
+{
+  archiveVersion = 1;
+  objectVersion = 77;
+  objects = {
+    ROOT /* Project object */ = { isa = PBXProject; mainGroup = MAIN; projectDirPath = ""; targets = ( TAPP, TWID, ); };
+    MAIN = { isa = PBXGroup; children = ( GAPP, FUTIL, FSDK, SYNC, ); sourceTree = "<group>"; };
+    GAPP /* App */ = { isa = PBXGroup; children = ( FMAIN, ); path = App; sourceTree = "<group>"; };
+    FMAIN = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMain.swift; sourceTree = "<group>"; };
+    FUTIL = { isa = PBXFileReference; path = "Shared/Util.swift"; sourceTree = SOURCE_ROOT; };
+    FSDK = { isa = PBXFileReference; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+    SYNC = { isa = PBXFileSystemSynchronizedRootGroup; exceptions = ( EXC, ); path = Widget; sourceTree = "<group>"; };
+    EXC = { isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = ( Preview.swift, ); target = TWID; };
+    TAPP = { isa = PBXNativeTarget; buildPhases = ( PAPP, ); name = App; };
+    PAPP = { isa = PBXSourcesBuildPhase; files = ( BMAIN, BUTIL, BSDK, ); };
+    BMAIN = { isa = PBXBuildFile; fileRef = FMAIN; };
+    BUTIL = { isa = PBXBuildFile; fileRef = FUTIL; };
+    BSDK = { isa = PBXBuildFile; fileRef = FSDK; };
+    TWID = { isa = PBXNativeTarget; buildPhases = ( PWID, ); fileSystemSynchronizedGroups = ( SYNC, ); name = Widget; };
+    PWID = { isa = PBXSourcesBuildPhase; files = ( BUTIL2, ); };
+    BUTIL2 = { isa = PBXBuildFile; fileRef = FUTIL; };
+  };
+  rootObject = ROOT;
+}
+`;
