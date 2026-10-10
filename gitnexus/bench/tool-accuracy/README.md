@@ -45,6 +45,15 @@ the cap/consumer contract without requiring 501 parser fixtures. It does not
 claim parser coverage for those synthetic records. Python checks read actual
 `context.outgoing.calls` symbol UIDs, preserving lexical/class ownership.
 
+Rename's positive fixtures construct each `Writer` receiver directly, including
+the imported class. A TypeScript parameter annotation alone cannot prove which
+structurally compatible runtime object owns a method; unsafe parameter receivers
+are covered by refusal regressions in the semantic rename unit tests. Fixture
+line anchors are updated together; the three exact semantic answers and the
+same-named method/function, comment and string controls remain required. The runner validates v2
+semantic provenance, exact UTF-16 spans and before/after source lines, then scores
+the whole `after` line. Semantic rename does not use ripgrep or text-search edits.
+
 ## Known gaps and repairs
 
 The initial source baseline is

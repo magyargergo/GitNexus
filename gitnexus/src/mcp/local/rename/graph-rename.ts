@@ -30,6 +30,16 @@ import { lookupNameClaim } from '../../../core/ingestion/scope-resolution/scope/
 import { definitionIdPosition } from '../../../core/ingestion/scope-resolution/utils/definition-id.js';
 import { createParserForLanguage } from '../../../core/tree-sitter/parser-loader.js';
 import {
+  constructorForReceiver,
+  hasPythonMangledNames,
+  hasUnsupportedIdentifiers,
+  inDynamicWithScope,
+  isReceiverWrite,
+  jsxTagRole,
+  sameHoistedVarBinding,
+  unsupportedIdentifierSpelling,
+} from './rename-safety.js';
+import {
   RenameFailure,
   repositoryPath,
   type RenameOptions,
@@ -91,7 +101,8 @@ export async function planGraphRename(
   if (
     typeof options.new_name !== 'string' ||
     !options.new_name ||
-    options.new_name === symbol.name
+    options.new_name === symbol.name ||
+    unsupportedIdentifierSpelling(options.new_name, language)
   ) {
     throw new RenameFailure('invalid_name', 'Choose a different, nonempty identifier.');
   }
@@ -161,6 +172,13 @@ export async function planGraphRename(
     const tree = parser.parse(content);
     if (!tree || tree.rootNode.hasError) {
       throw new RenameFailure('parse_error', `Cannot establish semantic coverage for ${filePath}.`);
+    }
+    if (hasUnsupportedIdentifiers(tree.rootNode, language)) {
+      throw new RenameFailure(
+        'unsupported_identifier',
+        `The provider cannot prove equivalent identifier spellings in ${filePath}.`,
+        'unsupported',
+      );
     }
     const parsed = extractParsedFile(resolver.languageProvider, content, filePath, undefined, tree);
     if (!parsed)
@@ -260,6 +278,22 @@ export async function planGraphRename(
   }
   const target = targetDefs[0]!;
   if (
+    language === SupportedLanguages.Python &&
+    CLASS_KINDS.includes(target.type) &&
+    files
+      .get(target.filePath)!
+      .namedOccurrences.some(
+        (token) =>
+          target.nameRange && contains(target.nameRange, token) && hasPythonMangledNames(token),
+      )
+  ) {
+    throw new RenameFailure(
+      'unsupported_symbol_family',
+      'Renaming a Python class with private-name or slot coupling requires a complete symbol-family plan.',
+      'unsupported',
+    );
+  }
+  if (
     CLASS_KINDS.includes(target.type) &&
     (definitions.some(
       (def) => def.ownerId === target.nodeId && simpleQualifiedName(def) === symbol.name,
@@ -310,6 +344,10 @@ export async function planGraphRename(
     providers: { arityCompatibility: resolver.arityCompatibility },
     ownedMembersByOwner: (owner, name) => lookupOwnedMembersByOwner(model, owner, name),
   });
+  const isJsTs =
+    language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript;
+  const receiverWrites = new Map<string, boolean>();
+  const constructorProofs = new Map<string, boolean>();
   const boundMembers = (site: ReferenceSite): readonly SymbolDefinition[] | undefined => {
     if (!site.explicitReceiver) return undefined;
     const receiverClaim = lookupNameClaim(site.inScope, site.explicitReceiver.name, indexes, {
@@ -317,6 +355,55 @@ export async function planGraphRename(
       purpose: 'value',
     });
     const type = receiverClaim.typeBinding;
+    const receiverFile = receiverClaim.scope && files.get(receiverClaim.scope.filePath);
+    if (receiverFile && receiverClaim.scope) {
+      const bindingKey = `${receiverClaim.scope.id}:${site.explicitReceiver.name}:${JSON.stringify(type?.bindingRange)}`;
+      let hasWrites = receiverWrites.get(bindingKey);
+      if (hasWrites === undefined) {
+        const initializer =
+          isJsTs &&
+          type &&
+          constructorForReceiver(receiverFile.tree.rootNode, site.explicitReceiver.name, type);
+        hasWrites = receiverFile.tokens.some((token) => {
+          if (token.text !== site.explicitReceiver!.name || !isReceiverWrite(token)) return false;
+          // Only this exact constructor declaration is an initial value proof.
+          // Any other initialized declaration may reassign a hoisted var.
+          if (initializer && initializer.parent?.parent?.childForFieldName('name')?.id === token.id)
+            return false;
+          if (initializer && sameHoistedVarBinding(token, initializer)) return true;
+          // Python and similar grammars use assignment for the initial binding.
+          // JS/TS declarations have a distinct declarator; every assignment is
+          // an additional write even when it supplied the merged TypeRef.
+          if (
+            !isJsTs &&
+            type?.source === 'constructor-inferred' &&
+            type.bindingRange &&
+            contains(type.bindingRange, token)
+          )
+            return false;
+          const scope = innermostScope(receiverFile.parsed, token);
+          const writeClaim =
+            scope &&
+            lookupNameClaim(scope, token.text, indexes, {
+              position: {
+                startLine: token.startPosition.row + 1,
+                startCol: token.startPosition.column,
+              },
+              purpose: 'value',
+            });
+          // A constructor-inferred fact in a nested function can claim a name
+          // without declaring it. Only lexical claims prove an unrelated write.
+          return (
+            !writeClaim ||
+            !writeClaim.scope ||
+            writeClaim.claims.length === 0 ||
+            writeClaim.scope.id === receiverClaim.scope!.id
+          );
+        });
+        receiverWrites.set(bindingKey, hasWrites);
+      }
+      if (hasWrites) return [];
+    }
     if (
       type?.source === 'decorator-unknown' ||
       (type?.declaredSpelling && type.declaredSpelling !== type.rawName)
@@ -336,6 +423,30 @@ export async function planGraphRename(
       ).values(),
     ];
     if (classOwners.length !== 1) return undefined;
+    if (type && type.source !== 'self' && isJsTs) {
+      const proofKey = `${receiverClaim.scope?.id}:${site.explicitReceiver.name}:${JSON.stringify(type)}:${classOwners[0]!.nodeId}`;
+      let proven = constructorProofs.get(proofKey);
+      if (proven === undefined) {
+        const constructor =
+          receiverFile &&
+          constructorForReceiver(receiverFile.tree.rootNode, site.explicitReceiver.name, type);
+        const constructorScope = constructor && innermostScope(receiverFile!.parsed, constructor);
+        const constructorOwners =
+          constructor && constructorScope && constructor.type === 'identifier'
+            ? lookupNameClaim(constructorScope, constructor.text, indexes, {
+                position: {
+                  startLine: constructor.startPosition.row + 1,
+                  startCol: constructor.startPosition.column,
+                },
+                purpose: 'value',
+              }).bindings
+            : [];
+        const ids = new Set(constructorOwners.map((owner) => owner.def.nodeId));
+        proven = ids.size === 1 && ids.has(classOwners[0]!.nodeId);
+        constructorProofs.set(proofKey, proven);
+      }
+      if (!proven) return [];
+    }
     return lookupOwnedMembersByOwner(model, classOwners[0]!.nodeId, site.name);
   };
   const edits = new Map<string, OccurrenceEdit>();
@@ -417,6 +528,13 @@ export async function planGraphRename(
         'A reference points outside the indexed source set.',
       );
     const token = tokenAtRange(file, site.nameRange);
+    if (isJsTs && inDynamicWithScope(token)) {
+      throw new RenameFailure(
+        'unsupported_occurrence',
+        `A dynamic with environment prevents lexical rename proof in ${file.path}.`,
+        'unsupported',
+      );
+    }
     if (accounted.has(key(file.path, token.startIndex))) continue;
     const claim =
       site.explicitReceiver === undefined
@@ -550,7 +668,8 @@ export async function planGraphRename(
         !replacement ||
         replacement.text !== options.new_name ||
         replacement.type !== original.type ||
-        replacement.parent?.type !== original.parent?.type
+        replacement.parent?.type !== original.parent?.type ||
+        jsxTagRole(replacement) !== jsxTagRole(original)
       ) {
         throw new RenameFailure(
           'invalid_name',
@@ -667,13 +786,7 @@ function isUnrelatedLabel(token: Parser.SyntaxNode): boolean {
   if (parent.type === 'keyword_argument' && parent.childForFieldName('name')?.id === token.id)
     return true;
   if (parent.type === 'jsx_attribute' && parent.firstNamedChild?.id === token.id) return true;
-  return (
-    ['jsx_opening_element', 'jsx_closing_element', 'jsx_self_closing_element'].includes(
-      parent.type,
-    ) &&
-    parent.childForFieldName('name')?.id === token.id &&
-    /^[a-z]/.test(token.text)
-  );
+  return jsxTagRole(token) === 'intrinsic';
 }
 
 function isParameterBinder(token: Parser.SyntaxNode): boolean {

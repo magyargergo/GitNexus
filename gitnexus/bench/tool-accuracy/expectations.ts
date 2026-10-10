@@ -6,14 +6,14 @@
  */
 export const FIXTURE_ANCHORS = {
   writerCloseDeclaration: { file: 'rename/writer.ts', line: 2, text: 'close(): void {}' },
-  writerCloseCall: { file: 'rename/writer.ts', line: 8, text: 'writer.close();' },
-  callerCloseCall: { file: 'rename/caller.ts', line: 3, text: 'writer.close();' },
+  writerCloseCall: { file: 'rename/writer.ts', line: 9, text: 'writer.close();' },
+  callerCloseCall: { file: 'rename/caller.ts', line: 4, text: 'writer.close();' },
   writerComment: {
     file: 'rename/writer.ts',
-    line: 10,
+    line: 11,
     text: '// close is a comment, not a reference.',
   },
-  writerString: { file: 'rename/writer.ts', line: 11, text: "export const title = 'close';" },
+  writerString: { file: 'rename/writer.ts', line: 12, text: "export const title = 'close';" },
   runGit: {
     file: 'src/security.ts',
     line: 4,

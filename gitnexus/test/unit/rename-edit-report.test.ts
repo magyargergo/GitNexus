@@ -39,7 +39,9 @@ const SOURCE = `export class Writer {
 export class Other {
   close() {}
 }
-export function run(writer: Writer, other: Other) {
+export function run() {
+  const writer = new Writer();
+  const other = new Other();
   const hooks = { close: () => writer.close() }; writer.close(); other.close();
   // close should remain in this comment.
   const title = 'close';
@@ -47,7 +49,10 @@ export function run(writer: Writer, other: Other) {
 }
 `;
 const CALLER = `import { Writer } from './writer.js';
-export function caller(writer: Writer) { writer.close(); }
+export function caller() {
+  const writer = new Writer();
+  writer.close();
+}
 `;
 
 function stubbedBackend(symbol: Record<string, unknown> = {}) {
@@ -71,7 +76,7 @@ function stubbedBackend(symbol: Record<string, unknown> = {}) {
 
 const callRename = (backend: LocalBackend, repoPath: string, params = {}) =>
   (backend as any).rename(
-    { repoPath },
+    { repoPath, lbugPath: path.join(repoPath, '.gitnexus', 'lbug') },
     {
       symbol_name: 'close',
       new_name: 'closeWriter',
@@ -125,17 +130,22 @@ describe('semantic rename reports exact applied occurrences (#3486, #2605)', () 
         name: 'run',
         filePath: 'src/writer.ts',
         startLine: 6,
-        endLine: 11,
+        endLine: 13,
       },
       {
         id: 'Function:src/caller.ts:caller',
         name: 'caller',
         filePath: 'src/caller.ts',
         startLine: 1,
-        endLine: 1,
+        endLine: 4,
       },
     );
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3486-backend-'));
+    await fs.mkdir(path.join(tmpDir, '.gitnexus'));
+    await fs.writeFile(
+      path.join(tmpDir, '.gitnexus', 'gitnexus.json'),
+      JSON.stringify({ contentRetention: 'full', indexedAt: '2024-06-01T12:00:00Z' }),
+    );
     await fs.mkdir(path.join(tmpDir, 'src'));
     await fs.writeFile(path.join(tmpDir, 'src/writer.ts'), SOURCE);
     await fs.writeFile(path.join(tmpDir, 'src/caller.ts'), CALLER);

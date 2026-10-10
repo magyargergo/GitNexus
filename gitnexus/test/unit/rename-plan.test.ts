@@ -122,6 +122,49 @@ describe('exact rename plan application', () => {
     expect(await fs.readFile(path.join(root, 'a.ts'), 'utf8')).toBe('close()');
   });
 
+  it('accepts landed outputs while applying an ordinary multi-file plan', async () => {
+    const p = await plan({ 'a.ts': 'close()', 'b.ts': 'close()' });
+    expect(await executeRenamePlan(root, p, false)).toMatchObject({
+      status: 'success',
+      applied: true,
+      application_status: 'applied',
+      total_edits: 2,
+      files_affected: 2,
+    });
+    expect(await fs.readFile(path.join(root, 'a.ts'), 'utf8')).toBe('finish()');
+    expect(await fs.readFile(path.join(root, 'b.ts'), 'utf8')).toBe('finish()');
+    expect((await fs.readdir(root)).sort()).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it.each([0, 1])(
+    'blocks installation when an unedited snapshot changes while staging file %i',
+    async (changeAt) => {
+      const p = await plan({ 'a.ts': 'close()', 'b.ts': 'close()', 'c.ts': '// no references' });
+      p.edits.pop();
+      const original = fs.writeFile.bind(fs);
+      let calls = 0;
+      vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+        await original(...args);
+        if (calls++ === changeAt) await original(path.join(root, 'c.ts'), 'close();');
+      });
+      expect(await executeRenamePlan(root, p, false)).toMatchObject({
+        status: 'partial',
+        applied: changeAt > 0,
+        application_status: changeAt ? 'partial' : 'failed',
+        code: 'source_changed',
+        total_edits: changeAt,
+        files_affected: changeAt,
+        failed_files: changeAt ? ['b.ts'] : ['a.ts', 'b.ts'],
+      });
+      expect(await fs.readFile(path.join(root, 'a.ts'), 'utf8')).toBe(
+        changeAt ? 'finish()' : 'close()',
+      );
+      expect(await fs.readFile(path.join(root, 'b.ts'), 'utf8')).toBe('close()');
+      expect(await fs.readFile(path.join(root, 'c.ts'), 'utf8')).toBe('close();');
+      expect((await fs.readdir(root)).sort()).toEqual(['a.ts', 'b.ts', 'c.ts']);
+    },
+  );
+
   it('rejects lexical traversal and symlink escapes', async () => {
     const p = await plan({ 'a.ts': 'close()' });
     p.edits[0].file_path = '../outside.ts';
@@ -171,22 +214,30 @@ describe('exact rename plan application', () => {
     expect((await fs.readdir(root)).sort()).toEqual(['a.ts', 'b.ts']);
   });
 
-  it('reports a race after an earlier write as partial', async () => {
-    const p = await plan({ 'a.ts': 'close()', 'b.ts': 'close()' });
-    const original = fs.rename.bind(fs);
-    vi.spyOn(fs, 'rename').mockImplementation(async (...args) => {
-      await original(...args);
-      if (String(args[1]).endsWith('a.ts'))
-        await fs.writeFile(path.join(root, 'b.ts'), 'user edit');
-    });
-    expect(await executeRenamePlan(root, p, false)).toMatchObject({
-      status: 'partial',
-      applied: true,
-      total_edits: 1,
-      failed_files: ['b.ts'],
-    });
-    expect(await fs.readFile(path.join(root, 'b.ts'), 'utf8')).toBe('user edit');
-  });
+  it.each(['a.ts', 'b.ts'])(
+    'reports a race in %s after an earlier write as partial',
+    async (changedFile) => {
+      const p = await plan({ 'a.ts': 'close()', 'b.ts': 'close()' });
+      const original = fs.rename.bind(fs);
+      vi.spyOn(fs, 'rename').mockImplementation(async (...args) => {
+        await original(...args);
+        if (String(args[1]).endsWith('a.ts'))
+          await fs.writeFile(path.join(root, changedFile), 'user edit');
+      });
+      expect(await executeRenamePlan(root, p, false)).toMatchObject({
+        status: 'partial',
+        applied: true,
+        application_status: 'partial',
+        code: 'source_changed',
+        total_edits: 1,
+        failed_files: ['b.ts'],
+      });
+      expect(await fs.readFile(path.join(root, changedFile), 'utf8')).toBe('user edit');
+      if (changedFile === 'a.ts')
+        expect(await fs.readFile(path.join(root, 'b.ts'), 'utf8')).toBe('close()');
+      expect((await fs.readdir(root)).sort()).toEqual(['a.ts', 'b.ts']);
+    },
+  );
 
   it('blocks a destination changed while staging its replacement', async () => {
     const p = await plan({ 'a.ts': 'close()' });

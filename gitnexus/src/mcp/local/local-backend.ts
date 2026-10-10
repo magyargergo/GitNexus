@@ -6785,6 +6785,8 @@ export class LocalBackend {
       file_path: params.file_path,
     });
     if (lookupResult.status === 'ambiguous' || lookupResult.error) return lookupResult;
+    const unavailable = await this.fullSourceUnavailable(repo);
+    if (unavailable) return unavailable;
     // Read the indexed file and declaration inventory, without context()'s
     // ranked/truncated incoming edges. Current sources rebuild semantic scopes;
     // a graph edge alone never authorizes a textual replacement.
