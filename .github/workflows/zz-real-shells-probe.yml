@@ -1,0 +1,44 @@
+# Temporary: iterates the real-shell search test on a fork branch. Not for main.
+name: real shells probe
+on:
+  push:
+    branches: ['test/real-shell-search-pattern']
+permissions:
+  contents: read
+concurrency:
+  group: real-shells-probe-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
+      - name: Ensure FTS + VECTOR extensions installed
+        shell: bash
+        working-directory: gitnexus
+        run: npx tsx scripts/ensure-fts.ts
+      - name: Hook tests (PR #4002) on this OS
+        shell: bash
+        working-directory: gitnexus
+        run: >-
+          npx vitest run --reporter=verbose
+          test/unit/search-command-pattern.test.ts
+          test/unit/claude-hook-runtime.test.ts
+          test/unit/cursor-hook.test.ts
+          test/unit/factory-plugin.test.ts
+          test/unit/hooks.test.ts
+          test/unit/setup.test.ts
+          test/unit/setup-antigravity.test.ts
+          test/integration/antigravity-hook-e2e.test.ts
+          test/integration/search-command-real-shells.test.ts
+          test/integration/augmentation.test.ts
