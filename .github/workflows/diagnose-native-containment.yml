@@ -6,12 +6,12 @@ permissions:
   contents: read
 jobs:
   repeat:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 18
     strategy:
       fail-fast: false
       matrix:
-        sample: [1, 2, 3, 4]
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -39,7 +39,15 @@ jobs:
           GITNEXUS_REQUIRE_PROPOSAL_CANARY: '1'
           CLAUDE_CANARY_BIN: ${{ runner.temp }}/claude-canary/node_modules/@anthropic-ai/claude-code-linux-x64/claude
         run: |
-          for trial in {1..24}; do
+          uv sync --locked --extra dev
+          for trial in {1..16}; do
             echo "Trial $trial"
-            uv run --locked --extra dev python -m pytest -p containment_probe -q -s --tb=short tests/test_proposal_evaluation.py::test_native_paired_proposal_cost_and_grading
+            pids=()
+            for lane in 1 2 3; do
+              .venv/bin/python -m pytest -p containment_probe -q -s --tb=short tests/test_proposal_evaluation.py::test_native_paired_proposal_cost_and_grading &
+              pids+=("$!")
+            done
+            status=0
+            for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+            if [[ $status != 0 ]]; then exit "$status"; fi
           done
