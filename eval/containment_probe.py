@@ -32,6 +32,7 @@ def pytest_configure(config):
                   row["error_kind"], row["cost_usd"],
                   {k: detail.get(k) for k in ("subtype", "process_state", "process_detail", "returncode", "event_stream_error")},
                   row.get("evidence_diagnostics"), flush=True)
+            print("offline fixture stderr", (detail.get("stderr_tail") or "")[-1200:], flush=True)
         return row
 
     def grading(*args, **kwargs):

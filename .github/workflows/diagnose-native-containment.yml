@@ -27,12 +27,17 @@ jobs:
           python-version: '3.13'
       - working-directory: gitnexus
         run: npm ci && npm run build
-      - run: npm ci --prefix .github/claude-canary-runtime --no-audit --no-fund
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends bubblewrap ripgrep socat
+          mkdir -p "$RUNNER_TEMP/claude-canary"
+          cp .github/claude-canary-runtime/package{,-lock}.json "$RUNNER_TEMP/claude-canary/"
+          npm ci --prefix "$RUNNER_TEMP/claude-canary" --no-audit --no-fund
       - name: Exercise the paired proposal canary
         working-directory: eval
         env:
           GITNEXUS_REQUIRE_PROPOSAL_CANARY: '1'
-          CLAUDE_CANARY_BIN: ${{ github.workspace }}/.github/claude-canary-runtime/node_modules/@anthropic-ai/claude-code-linux-x64/claude
+          CLAUDE_CANARY_BIN: ${{ runner.temp }}/claude-canary/node_modules/@anthropic-ai/claude-code-linux-x64/claude
         run: |
           for trial in {1..24}; do
             echo "Trial $trial"
