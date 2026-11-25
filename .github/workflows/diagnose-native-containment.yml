@@ -1,0 +1,40 @@
+name: Diagnose native proposal containment
+on:
+  push:
+    branches: [ci/diagnose-eval-containment]
+permissions:
+  contents: read
+jobs:
+  repeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: gitnexus/package-lock.json
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: 0.11.23
+          python-version: '3.13'
+      - working-directory: gitnexus
+        run: npm ci && npm run build
+      - run: npm ci --prefix .github/claude-canary-runtime --no-audit --no-fund
+      - name: Exercise the paired proposal canary
+        working-directory: eval
+        env:
+          GITNEXUS_REQUIRE_PROPOSAL_CANARY: '1'
+          CLAUDE_CANARY_BIN: ${{ github.workspace }}/.github/claude-canary-runtime/node_modules/@anthropic-ai/claude-code-linux-x64/claude
+        run: |
+          for trial in {1..24}; do
+            echo "Trial $trial"
+            uv run --locked --extra dev python -m pytest -p containment_probe -q -s --tb=short tests/test_proposal_evaluation.py::test_native_paired_proposal_cost_and_grading
+          done
